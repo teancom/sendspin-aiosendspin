@@ -78,19 +78,14 @@ class PCMFormat:
 
 @dataclass(slots=True)
 class AudioFormat:
-    """Audio format description including codec type.
-
-    For PCM, audio_data contains raw samples. For compressed codecs (FLAC, Opus),
-    audio_data contains compressed frames that must be decoded by the receiver.
-    The pcm_format describes the decoded audio characteristics.
-    """
+    """Audio format description including codec type."""
 
     codec: AudioCodec
     """Audio codec used for encoding."""
     pcm_format: PCMFormat
-    """Format of the decoded PCM audio."""
+    """Format of decoded PCM audio."""
     codec_header: bytes | None = None
-    """Optional codec-specific header data (e.g., FLAC streaminfo)."""
+    """Optional codec-specific header bytes (e.g., FLAC streaminfo)."""
 
 
 # Callback invoked when server state metadata updates are received.
@@ -107,14 +102,13 @@ StreamStartCallback = Callable[[StreamStartMessage], None]
 
 # Callback invoked when audio streaming ends.
 # Receives list of roles to end, or None if all roles should be ended.
-StreamEndCallback = Callable[[list[Roles] | None], None]
+StreamEndCallback = Callable[[list[str] | None], None]
 
 # Callback invoked when stream buffers should be cleared (e.g., seek operation).
 # Receives list of roles to clear, or None if all roles should be cleared.
-StreamClearCallback = Callable[[list[Roles] | None], None]
+StreamClearCallback = Callable[[list[str] | None], None]
 
 # Callback invoked with (server_timestamp_us, audio_data, format) when audio chunks arrive.
-# For PCM, audio_data is raw samples. For FLAC/Opus, it's compressed frames to decode.
 AudioChunkCallback = Callable[[int, bytes, AudioFormat], None]
 
 # Callback invoked when the client disconnects from the server.
@@ -185,7 +179,7 @@ class SendspinClient:
     _current_player: StreamStartPlayer | None = None
     """Current active player configuration."""
     _current_audio_format: AudioFormat | None = None
-    """Current audio format for active stream (includes codec info)."""
+    """Current audio format for active stream."""
     _stream_active: bool = False
     """True if stream is active (stream/start received, stream/end not yet received)."""
 
@@ -585,7 +579,7 @@ class SendspinClient:
             client_id=self._client_id,
             name=self._client_name,
             version=1,
-            supported_roles=self._roles,
+            supported_roles=[r.value for r in self._roles],
             device_info=self._device_info,
             player_support=self._player_support,
             artwork_support=self._artwork_support,
@@ -628,7 +622,7 @@ class SendspinClient:
         elif msg.type is WSMsgType.BINARY:
             self._handle_binary_message(msg.data)
         elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
-            logger.info("WebSocket closed by server")
+            logger.debug("WebSocket closed by server")
             await self.disconnect()
         elif msg.type is WSMsgType.ERROR:
             logger.error("WebSocket error: %s", self._ws.exception() if self._ws else "unknown")
@@ -675,7 +669,7 @@ class SendspinClient:
             return
 
         if not self._stream_active:
-            logger.warning(
+            logger.debug(
                 "Ignoring binary message of type %s since no stream is active", message_type
             )
             return
@@ -719,7 +713,6 @@ class SendspinClient:
             logger.debug("Stream start message without player payload")
             return
 
-        # Accept PCM and FLAC codecs (Opus support can be added later)
         if player.codec not in (AudioCodec.PCM, AudioCodec.FLAC):
             logger.error(
                 "Unsupported codec '%s' - only PCM and FLAC are supported", player.codec.value
@@ -738,17 +731,17 @@ class SendspinClient:
             channels=player.channels,
             bit_depth=player.bit_depth,
         )
-        # Decode base64 codec_header to bytes if present
         codec_header_bytes: bytes | None = None
         if player.codec_header:
             codec_header_bytes = base64.b64decode(player.codec_header)
 
-        audio_format = AudioFormat(
-            codec=player.codec,
-            pcm_format=pcm_format,
-            codec_header=codec_header_bytes,
+        self._configure_audio_output(
+            AudioFormat(
+                codec=player.codec,
+                pcm_format=pcm_format,
+                codec_header=codec_header_bytes,
+            )
         )
-        self._configure_audio_output(audio_format)
         self._current_player = StreamStartPlayer(
             codec=player.codec,
             sample_rate=player.sample_rate,
@@ -763,15 +756,15 @@ class SendspinClient:
 
     def _handle_stream_clear(self, message: StreamClearMessage) -> None:
         roles = message.payload.roles
-        logger.info("Stream clear received for roles: %s", roles or "all")
+        logger.debug("Stream clear received for roles: %s", roles or "all")
         self._notify_stream_clear(roles)
 
     def _handle_stream_end(self, message: StreamEndMessage) -> None:
         roles = message.payload.roles
-        logger.info("Stream ended for roles: %s", roles or "all")
+        logger.debug("Stream ended for roles: %s", roles or "all")
 
         # If roles is None or includes player role, end the player stream
-        if roles is None or Roles.PLAYER in roles:
+        if roles is None or "player" in roles:
             self._stream_active = False
             self._current_player = None
             self._current_audio_format = None
@@ -880,14 +873,14 @@ class SendspinClient:
             except Exception:
                 logger.exception("Error in stream start callback %s", callback)
 
-    def _notify_stream_end(self, roles: list[Roles] | None) -> None:
+    def _notify_stream_end(self, roles: list[str] | None) -> None:
         for callback in list(self._stream_end_callbacks):
             try:
                 callback(roles)
             except Exception:
                 logger.exception("Error in stream end callback %s", callback)
 
-    def _notify_stream_clear(self, roles: list[Roles] | None) -> None:
+    def _notify_stream_clear(self, roles: list[str] | None) -> None:
         for callback in list(self._stream_clear_callbacks):
             try:
                 callback(roles)

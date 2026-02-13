@@ -13,12 +13,15 @@ __all__ = [
     "ClientEvent",
     "ClientGroupChangedEvent",
     "ClientRemovedEvent",
+    "ClientRoleEvent",
     "DisconnectBehaviour",
-    "GroupCommandEvent",
+    "ExternalStreamStartCallback",
+    "ExternalStreamStartRequest",
     "GroupDeletedEvent",
     "GroupEvent",
     "GroupMemberAddedEvent",
     "GroupMemberRemovedEvent",
+    "GroupRoleEvent",
     "GroupStateChangedEvent",
     "SendspinClient",
     "SendspinEvent",
@@ -27,16 +30,30 @@ __all__ = [
     "VolumeChangedEvent",
 ]
 
+from aiosendspin.models.types import AudioCodec
+
+from .audio import AudioFormat
 from .client import DisconnectBehaviour, SendspinClient
-from .events import ClientEvent, ClientGroupChangedEvent, VolumeChangedEvent
-from .group import (
-    GroupCommandEvent,
+from .events import (
+    ClientEvent,
+    ClientGroupChangedEvent,
+    ClientRoleEvent,
     GroupDeletedEvent,
     GroupEvent,
     GroupMemberAddedEvent,
     GroupMemberRemovedEvent,
+    GroupRoleEvent,
     GroupStateChangedEvent,
+)
+from .group import (
     SendspinGroup,
 )
-from .server import ClientAddedEvent, ClientRemovedEvent, SendspinEvent, SendspinServer
-from .stream import AudioCodec, AudioFormat
+from .roles.player.events import VolumeChangedEvent
+from .server import (
+    ClientAddedEvent,
+    ClientRemovedEvent,
+    ExternalStreamStartCallback,
+    ExternalStreamStartRequest,
+    SendspinEvent,
+    SendspinServer,
+)

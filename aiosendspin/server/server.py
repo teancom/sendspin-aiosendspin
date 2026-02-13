@@ -1,4 +1,4 @@
-"""Sendspin Server implementation to connect to and manage many Sendspin Clients."""
+"""Sendspin Server implementation to connect to and manage many Sendspin clients."""
 
 from __future__ import annotations
 
@@ -9,7 +9,13 @@ from contextlib import suppress
 from dataclasses import dataclass
 from ipaddress import ip_address
 
-from aiohttp import ClientConnectionError, ClientResponseError, ClientTimeout, ClientWSTimeout, web
+from aiohttp import (
+    ClientConnectionError,
+    ClientResponseError,
+    ClientTimeout,
+    ClientWSTimeout,
+    web,
+)
 from aiohttp.client import ClientSession
 from zeroconf import (
     InterfaceChoice,
@@ -20,9 +26,14 @@ from zeroconf import (
 )
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
-from aiosendspin.util import get_local_ip
+from aiosendspin.models.core import ClientHelloPayload
+from aiosendspin.models.types import ConnectionReason, GoodbyeReason
+from aiosendspin.util import create_task, get_local_ip
 
 from .client import SendspinClient
+from .clock import Clock, LoopClock
+from .connection import SendspinConnection
+from .group import SendspinGroup
 
 logger = logging.getLogger(__name__)
 
@@ -33,16 +44,28 @@ class SendspinEvent:
 
 @dataclass
 class ClientAddedEvent(SendspinEvent):
-    """A new client was added."""
+    """A new persistent client/device was added."""
 
     client_id: str
 
 
 @dataclass
 class ClientRemovedEvent(SendspinEvent):
-    """A client disconnected from the server."""
+    """A persistent client/device was removed from the server."""
 
     client_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalStreamStartRequest:
+    """Request payload for externally managed player connection on stream start."""
+
+    client_id: str
+    server: SendspinServer
+    connection_reason: ConnectionReason = ConnectionReason.PLAYBACK
+
+
+ExternalStreamStartCallback = Callable[[ExternalStreamStartRequest], None]
 
 
 def _get_first_valid_ip(addresses: list[str]) -> str | None:
@@ -52,59 +75,17 @@ def _get_first_valid_ip(addresses: list[str]) -> str | None:
             addr = ip_address(addr_str)
         except ValueError:
             continue
-        # Skip link-local addresses (169.254.x.x for IPv4, fe80:: for IPv6)
-        # and unspecified addresses (0.0.0.0, ::)
         if not addr.is_link_local and not addr.is_unspecified:
             return addr_str
     return None
 
 
 class SendspinServer:
-    """Sendspin Server implementation to connect to and manage many Sendspin Clients."""
+    """Sendspin Server implementation to connect to and manage many Sendspin clients."""
 
     API_PATH = "/sendspin"  # Fixed by protocol
-
-    _clients: set[SendspinClient]
-    """All clients connected to this server."""
-    _pending_clients: set[SendspinClient]
-    """Clients that have connected but haven't completed the protocol handshake."""
-    _loop: asyncio.AbstractEventLoop
-    _event_cbs: list[Callable[[SendspinServer, SendspinEvent], None]]
-    _connection_tasks: dict[str, asyncio.Task[None]]
-    """
-    All tasks managing client connections.
-
-    This only includes connections initiated via connect_to_client (Server -> Client).
-    """
-    _retry_events: dict[str, asyncio.Event]
-    """
-    For each connection task in _connection_tasks, this holds an asyncio.Event.
-
-    This event is used to signal an immediate retry of the connection, in case the connection is
-    sleeping during a backoff period.
-    """
-    _id: str
-    _name: str
-    _client_session: ClientSession
-    """The client session used to connect to clients."""
-    _owns_session: bool
-    """Whether this server instance owns the client session."""
-    _app: web.Application | None
-    """
-    Web application instance for the server.
-
-    This is used to handle incoming WebSocket connections from clients.
-    """
-    _app_runner: web.AppRunner | None
-    """App runner for the web application."""
-    _tcp_site: web.TCPSite | None
-    """TCP site for the web application."""
-    _zc: AsyncZeroconf | None
-    """AsyncZeroconf instance."""
-    _mdns_service: AsyncServiceInfo | None
-    """Registered mDNS service."""
-    _mdns_browser: AsyncServiceBrowser | None
-    """mDNS service browser for client discovery."""
+    _pending_connections: set[SendspinConnection]
+    """Incoming connections that have not finished their handshake/message loop yet."""
 
     def __init__(
         self,
@@ -112,213 +93,130 @@ class SendspinServer:
         server_id: str,
         server_name: str,
         client_session: ClientSession | None = None,
+        *,
+        clock: Clock | None = None,
     ) -> None:
-        """
-        Initialize a new Sendspin Server.
-
-        Args:
-            loop: The asyncio event loop to use for asynchronous operations.
-            server_id: Unique identifier for this server instance.
-            server_name: Human-readable name for this server.
-            client_session: Optional ClientSession for outgoing connections.
-                If None, a new session will be created.
-        """
-        self._clients: set[SendspinClient] = set()
-        self._pending_clients: set[SendspinClient] = set()
+        """Initialize a Sendspin server instance."""
         self._loop = loop
-        self._event_cbs = []
         self._id = server_id
         self._name = server_name
+        self._clock: Clock = clock or LoopClock(loop)
+
+        self._clients: dict[str, SendspinClient] = {}
+        self._event_cbs: list[Callable[[SendspinServer, SendspinEvent], None]] = []
+
         if client_session is None:
             self._client_session = ClientSession(loop=self._loop, timeout=ClientTimeout(total=30))
             self._owns_session = True
         else:
             self._client_session = client_session
             self._owns_session = False
-        self._connection_tasks = {}
-        self._retry_events = {}
-        self._mdns_client_urls: dict[str, str] = {}  # mDNS service name -> WebSocket URL
-        self._app = None
-        self._app_runner = None
-        self._tcp_site = None
-        self._zc = None
-        self._mdns_service = None
-        self._mdns_browser = None
+
+        self._connection_tasks: dict[str, asyncio.Task[None]] = {}
+        self._retry_events: dict[str, asyncio.Event] = {}
+        self._initial_connect_waiters: dict[str, list[asyncio.Future[None]]] = {}
+        self._initial_connect_succeeded: set[str] = set()
+        self._connection_reasons: dict[str, ConnectionReason] = {}  # url → reason
+        self._client_urls: dict[str, str] = {}  # client_id → url
+        self._external_stream_start_cbs: dict[str, ExternalStreamStartCallback] = {}
+        self._pending_connections = set()
+
+        self._mdns_client_urls: dict[str, str] = {}
+        self._app: web.Application | None = None
+        self._app_runner: web.AppRunner | None = None
+        self._tcp_site: web.TCPSite | None = None
+        self._zc: AsyncZeroconf | None = None
+        self._mdns_service: AsyncServiceInfo | None = None
+        self._mdns_browser: AsyncServiceBrowser | None = None
+
         logger.debug("SendspinServer initialized: id=%s, name=%s", server_id, server_name)
 
     def _create_web_application(self) -> web.Application:
-        """
-        Create and configure the aiohttp web application.
-
-        Returns:
-            Configured aiohttp web.Application instance.
-        """
         app = web.Application()
         app.router.add_get(self.API_PATH, self.on_client_connect)
         return app
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
-        """Read-only access to the event loop used by this server."""
+        """Return the asyncio loop used by the server."""
         return self._loop
 
-    async def on_client_connect(self, request: web.Request) -> web.StreamResponse:
-        """Handle an incoming WebSocket connection from a Sendspin client."""
-        logger.debug("Incoming client connection from %s", request.remote)
+    @property
+    def clock(self) -> Clock:
+        """Time source used for timestamping."""
+        return self._clock
 
-        client = SendspinClient(
-            self,
-            handle_client_connect=self._handle_client_connect,
-            handle_client_disconnect=self._handle_client_disconnect,
-            request=request,
-        )
-        self._pending_clients.add(client)
-        try:
-            await client._handle_client()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        finally:
-            self._pending_clients.discard(client)
+    @property
+    def id(self) -> str:
+        """Return the server identifier advertised to clients."""
+        return self._id
 
-        websocket = client.websocket_connection
-        # This is a WebSocketResponse since we just created client
-        # as client-initiated.
-        assert isinstance(websocket, web.WebSocketResponse)
-        return websocket
+    @property
+    def name(self) -> str:
+        """Return the human-readable server name."""
+        return self._name
 
-    async def connect_to_client(self, url: str) -> None:
-        """
-        Connect to the Sendspin client at the given URL.
+    @property
+    def clients(self) -> list[SendspinClient]:
+        """All known clients (including disconnected)."""
+        return list(self._clients.values())
 
-        If an active connection already exists for this URL, nothing will happen.
-        If the initial connection fails, an exception is raised.
-        In case of disconnection after a successful connection, reconnection will
-        be attempted automatically.
+    @property
+    def connected_clients(self) -> list[SendspinClient]:
+        """All currently connected clients."""
+        return [c for c in self._clients.values() if c.is_connected]
 
-        Raises:
-            ClientConnectionError: If the initial connection to the client fails.
-            ClientResponseError: If the client responds with an error HTTP status.
-            TimeoutError: If the initial connection times out.
-        """
-        logger.debug("Connecting to client at URL: %s", url)
-        prev_task = self._connection_tasks.get(url)
-        if prev_task is not None:
-            logger.debug("Connection is already active for URL: %s", url)
-            # Signal immediate retry if we have a retry event (connection is in backoff)
-            if retry_event := self._retry_events.get(url):
-                logger.debug("Signaling immediate retry for URL: %s", url)
-                retry_event.set()
+    def get_client(self, client_id: str) -> SendspinClient | None:
+        """Get a persistent client device by id, if known."""
+        return self._clients.get(client_id)
+
+    def get_or_create_client(self, client_id: str) -> SendspinClient:
+        """Get or create a persistent client device by id."""
+        client = self._clients.get(client_id)
+        if client is None:
+            client = SendspinClient(self, client_id=client_id)
+            self._clients[client_id] = client
+            SendspinGroup(self, client)
+            self._signal_event(ClientAddedEvent(client_id))
+        return client
+
+    async def remove_client(self, client_id: str) -> None:
+        """Remove a client from the persistent registry."""
+        client = self._clients.pop(client_id, None)
+        if client is None:
             return
+        self._external_stream_start_cbs.pop(client_id, None)
+        await client.group.remove_client(client)
+        self._signal_event(ClientRemovedEvent(client_id))
 
-        # Create a future to wait for initial connection result
-        initial_connect_future: asyncio.Future[None] = self._loop.create_future()
+    def register_external_player(
+        self,
+        hello: ClientHelloPayload,
+        *,
+        on_stream_start: ExternalStreamStartCallback,
+    ) -> SendspinClient:
+        """Register a client identity that is connected by external orchestration."""
+        client = self.get_or_create_client(hello.client_id)
+        if client.is_connected:
+            raise RuntimeError(
+                f"Cannot register external player {hello.client_id!r} while client is connected"
+            )
+        client.preload_hello(hello)
+        self._external_stream_start_cbs[hello.client_id] = on_stream_start
+        return client
 
-        # Create retry event for this connection
-        self._retry_events[url] = asyncio.Event()
-        self._connection_tasks[url] = self._loop.create_task(
-            self._handle_client_connection(url, initial_connect_future)
-        )
+    def unregister_external_player(self, client_id: str) -> None:
+        """Remove external stream-start callback for a registered client."""
+        self._external_stream_start_cbs.pop(client_id, None)
 
-        # Wait for initial connection to complete or fail
-        await initial_connect_future
-
-    def disconnect_from_client(self, url: str) -> None:
-        """
-        Disconnect from the Sendspin client that was previously connected at the given URL.
-
-        If no connection was established at this URL, or the connection is already closed,
-        this will do nothing.
-
-        NOTE: this will only disconnect connections that were established via connect_to_client.
-        """
-        connection_task = self._connection_tasks.pop(url, None)
-        if connection_task is not None:
-            logger.debug("Disconnecting from client at URL: %s", url)
-            connection_task.cancel()
-
-    async def _handle_client_connection(  # noqa: PLR0915
-        self, url: str, initial_connect_future: asyncio.Future[None]
-    ) -> None:
-        """Handle the actual connection to a client."""
-        backoff = 1.0
-        max_backoff = 300.0  # 5 minutes
-        first_connection_succeeded = False
-
-        try:
-            while True:
-                client: SendspinClient | None = None
-                retry_event = self._retry_events.get(url)
-
-                try:
-                    async with self._client_session.ws_connect(
-                        url,
-                        heartbeat=30,
-                        # Pyright doesn't recognise the signature
-                        timeout=ClientWSTimeout(ws_close=10, ws_receive=60),  # pyright: ignore[reportCallIssue]
-                    ) as wsock:
-                        # Signal initial connection success
-                        if not first_connection_succeeded:
-                            first_connection_succeeded = True
-                            if not initial_connect_future.done():
-                                initial_connect_future.set_result(None)
-                        backoff = 1.0
-                        client = SendspinClient(
-                            self,
-                            handle_client_connect=self._handle_client_connect,
-                            handle_client_disconnect=self._handle_client_disconnect,
-                            wsock_client=wsock,
-                        )
-                        await client._handle_client()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-                    if self._client_session.closed or (client and client.closing):
-                        break
-                except asyncio.CancelledError:
-                    if not initial_connect_future.done():
-                        initial_connect_future.cancel()
-                    raise
-                except (TimeoutError, ClientConnectionError, ClientResponseError) as err:
-                    if not first_connection_succeeded:
-                        if not initial_connect_future.done():
-                            initial_connect_future.set_exception(err)
-                        return
-                    logger.debug("Connection task for %s failed: %s", url, err)
-
-                if backoff >= max_backoff:
-                    break
-
-                logger.debug("Trying to reconnect to client at %s in %.1fs", url, backoff)
-
-                # Use asyncio.wait_for with the retry event to allow immediate retry
-                if retry_event is not None:
-                    try:
-                        await asyncio.wait_for(retry_event.wait(), timeout=backoff)
-                        logger.debug("Immediate retry requested for %s", url)
-                        retry_event.clear()
-                    except TimeoutError:
-                        pass  # Normal timeout, continue with exponential backoff
-                else:
-                    await asyncio.sleep(backoff)
-
-                backoff *= 2
-        except asyncio.CancelledError:
-            pass
-        except Exception as err:
-            if not first_connection_succeeded and not initial_connect_future.done():
-                initial_connect_future.set_exception(err)
-            logger.exception("Unexpected error occurred")
-        finally:
-            self._connection_tasks.pop(url, None)
-            self._retry_events.pop(url, None)
+    def is_external_player(self, client_id: str) -> bool:
+        """Whether this client is externally managed for playback connects."""
+        return client_id in self._external_stream_start_cbs
 
     def add_event_listener(
         self, callback: Callable[[SendspinServer, SendspinEvent], None]
     ) -> Callable[[], None]:
-        """
-        Register a callback to listen for state changes of the server.
-
-        State changes include:
-        - A new client was connected
-        - A client disconnected
-
-        Returns a function to remove the listener.
-        """
+        """Register a callback for server events and return an unsubscribe callable."""
         self._event_cbs.append(callback)
 
         def _remove() -> None:
@@ -328,70 +226,218 @@ class SendspinServer:
         return _remove
 
     def _signal_event(self, event: SendspinEvent) -> None:
-        """Signal an event to all registered listeners."""
         for cb in self._event_cbs:
             try:
                 cb(self, event)
             except Exception:
                 logger.exception("Error in event listener")
 
-    async def _handle_client_connect(self, client: SendspinClient) -> None:
-        """
-        Register the client to the server.
+    async def on_client_connect(self, request: web.Request) -> web.StreamResponse:
+        """Handle an incoming WebSocket connection from a Sendspin client."""
+        logger.debug("Incoming client connection from %s", request.remote)
 
-        Should only be called once all data like the client id was received.
-        If a client with the same ID already exists, the old connection is closed.
+        conn = SendspinConnection(self, request=request)
+        self._pending_connections.add(conn)
+        try:
+            await conn._handle_client()  # noqa: SLF001
+        finally:
+            self._pending_connections.discard(conn)
+
+        websocket = conn.websocket_connection
+        assert isinstance(websocket, web.WebSocketResponse)
+        return websocket
+
+    def connect_to_client(
+        self, url: str, *, connection_reason: ConnectionReason = ConnectionReason.DISCOVERY
+    ) -> None:
+        """Start a background connection attempt to a client URL.
+
+        Initial connection failures are logged and stop the background task.
+        Automatic retries only happen after at least one successful connection.
         """
-        if client in self._clients:
+        self._connection_reasons[url] = connection_reason
+        prev_task = self._connection_tasks.get(url)
+        if prev_task is not None:
+            if retry_event := self._retry_events.get(url):
+                retry_event.set()
             return
 
-        # Check for existing client with same ID and disconnect it
-        if (existing := self.get_client(client.client_id)) is not None:
-            logger.info("Client %s reconnected, closing previous connection", client.client_id)
-            # Fire removal event before awaiting disconnect to ensure correct event order
-            self._handle_client_disconnect(existing)
-            try:
-                await existing.disconnect(retry_connection=False)
-            except Exception:
-                logger.exception("Error disconnecting replaced client %s", client.client_id)
+        self._initial_connect_succeeded.discard(url)
+        self._retry_events[url] = asyncio.Event()
+        self._connection_tasks[url] = create_task(
+            self._handle_client_connection(url),
+            eager_start=False,
+        )
 
-        logger.debug("Adding client %s (%s) to server", client.client_id, client.name)
-        self._clients.add(client)
-        self._signal_event(ClientAddedEvent(client.client_id))
+    async def connect_to_client_and_wait(
+        self, url: str, *, connection_reason: ConnectionReason = ConnectionReason.DISCOVERY
+    ) -> None:
+        """Connect to a client and wait for the initial connection attempt.
 
-    def _handle_client_disconnect(self, client: SendspinClient) -> None:
-        """Unregister the client from the server."""
-        if client not in self._clients:
+        Raises:
+            ClientConnectionError: If the initial connection to the client fails.
+            ClientResponseError: If the client responds with an error HTTP status.
+            TimeoutError: If the initial connection attempt times out.
+            Exception: Other unexpected errors during the initial connection attempt.
+        """
+        self._connection_reasons[url] = connection_reason
+        if url in self._initial_connect_succeeded:
             return
 
-        logger.debug("Removing client %s from server", client.client_id)
-        self._clients.remove(client)
-        self._signal_event(ClientRemovedEvent(client.client_id))
+        waiter: asyncio.Future[None] = self._loop.create_future()
+        self._initial_connect_waiters.setdefault(url, []).append(waiter)
 
-    @property
-    def clients(self) -> set[SendspinClient]:
-        """Get the set of all clients connected to this server."""
-        return self._clients
+        prev_task = self._connection_tasks.get(url)
+        if prev_task is not None:
+            if retry_event := self._retry_events.get(url):
+                retry_event.set()
+        else:
+            self._initial_connect_succeeded.discard(url)
+            self._retry_events[url] = asyncio.Event()
+            self._connection_tasks[url] = create_task(
+                self._handle_client_connection(url),
+                eager_start=False,
+            )
 
-    def get_client(self, client_id: str) -> SendspinClient | None:
-        """Get the client with the given id."""
-        logger.debug("Looking for client with id: %s", client_id)
-        for client in self.clients:
-            if client.client_id == client_id:
-                logger.debug("Found client %s", client_id)
-                return client
-        logger.debug("Client %s not found", client_id)
-        return None
+        await waiter
 
-    @property
-    def id(self) -> str:
-        """Get the unique identifier of this server."""
-        return self._id
+    def get_connection_reason(self, url: str) -> ConnectionReason:
+        """Get the connection reason for a URL (for use by SendspinConnection)."""
+        return self._connection_reasons.get(url, ConnectionReason.DISCOVERY)
 
-    @property
-    def name(self) -> str:
-        """Get the name of this server."""
-        return self._name
+    def register_client_url(self, client_id: str, url: str) -> None:
+        """Record the URL used to connect to a client."""
+        self._client_urls[client_id] = url
+
+    def get_client_url(self, client_id: str) -> str | None:
+        """Get the URL for a client (for reconnection)."""
+        return self._client_urls.get(client_id)
+
+    def reclaim_client_for_playback(self, client_id: str) -> bool:
+        """Attempt to reconnect to a client for playback.
+
+        Returns True if reconnection was initiated, False if no URL available.
+        Used when starting playback to reclaim clients that disconnected with 'another_server'.
+        """
+        url = self._client_urls.get(client_id)
+        if url is None:
+            return False
+
+        self.connect_to_client(url, connection_reason=ConnectionReason.PLAYBACK)
+        return True
+
+    def request_client_playback_connection(self, client_id: str) -> bool:
+        """Request that a disconnected client connect for playback."""
+        external_cb = self._external_stream_start_cbs.get(client_id)
+        if external_cb is None:
+            return self.reclaim_client_for_playback(client_id)
+
+        request = ExternalStreamStartRequest(
+            client_id=client_id,
+            server=self,
+        )
+        try:
+            external_cb(request)
+        except Exception:
+            logger.exception(
+                "External stream-start callback failed for client_id=%s",
+                client_id,
+            )
+            return False
+        return True
+
+    def disconnect_from_client(self, url: str) -> None:
+        """Disconnect a server-initiated connection previously established via connect_to_client."""
+        connection_task = self._connection_tasks.pop(url, None)
+        if connection_task is not None:
+            connection_task.cancel()
+
+    def _resolve_initial_connect_waiters(self, url: str, err: BaseException | None = None) -> None:
+        """Resolve or fail waiters for an initial connection attempt."""
+        waiters = self._initial_connect_waiters.pop(url, [])
+        for waiter in waiters:
+            if waiter.done():
+                continue
+            if err is None:
+                waiter.set_result(None)
+            else:
+                waiter.set_exception(err)
+
+    async def _handle_client_connection(self, url: str) -> None:  # noqa: PLR0915
+        """Handle a server-initiated WebSocket connection task."""
+        backoff = 1.0
+        max_backoff = 300.0
+        first_connection_succeeded = False
+
+        try:
+            while True:
+                retry_event = self._retry_events.get(url)
+                try:
+                    async with self._client_session.ws_connect(
+                        url,
+                        heartbeat=30,
+                        timeout=ClientWSTimeout(ws_close=10, ws_receive=60),  # pyright: ignore[reportCallIssue]
+                    ) as wsock:
+                        if not first_connection_succeeded:
+                            first_connection_succeeded = True
+                            self._initial_connect_succeeded.add(url)
+                            self._resolve_initial_connect_waiters(url)
+                        backoff = 1.0
+                        conn = SendspinConnection(self, wsock_client=wsock, url=url)
+                        await conn._handle_client()  # noqa: SLF001
+
+                    if not conn.should_retry_server_initiated_connection:
+                        if conn.goodbye_reason == GoodbyeReason.ANOTHER_SERVER:
+                            logger.debug(
+                                "Not reconnecting to %s after goodbye reason another_server",
+                                url,
+                            )
+                        break
+
+                    if self._client_session.closed:
+                        break
+
+                except asyncio.CancelledError:
+                    if not first_connection_succeeded:
+                        self._resolve_initial_connect_waiters(url, asyncio.CancelledError())
+                    break
+                except TimeoutError:
+                    if not first_connection_succeeded:
+                        logger.debug("Initial connection to %s timed out", url)
+                        self._resolve_initial_connect_waiters(url, TimeoutError())
+                        return
+                    logger.debug("Connection task for %s timed out", url)
+                except (ClientConnectionError, ClientResponseError) as err:
+                    if not first_connection_succeeded:
+                        logger.debug("Initial connection to %s failed: %s", url, err)
+                        self._resolve_initial_connect_waiters(url, err)
+                        return
+                    logger.debug("Connection task for %s failed: %s", url, err)
+
+                if backoff >= max_backoff:
+                    break
+
+                logger.debug("Trying to reconnect to client at %s in %.1fs", url, backoff)
+                if retry_event is not None:
+                    try:
+                        await asyncio.wait_for(retry_event.wait(), timeout=backoff)
+                        retry_event.clear()
+                    except TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(backoff)
+                backoff *= 2
+        except asyncio.CancelledError:
+            if not first_connection_succeeded:
+                self._resolve_initial_connect_waiters(url, asyncio.CancelledError())
+        except Exception as err:
+            if not first_connection_succeeded:
+                self._resolve_initial_connect_waiters(url, err)
+            logger.exception("Unexpected error occurred")
+        finally:
+            self._connection_tasks.pop(url, None)
+            self._retry_events.pop(url, None)
+            self._initial_connect_succeeded.discard(url)
 
     async def start_server(
         self,
@@ -401,23 +447,7 @@ class SendspinServer:
         *,
         discover_clients: bool = True,
     ) -> None:
-        """
-        Start the Sendspin Server.
-
-        This will start the Sendspin server to connect to clients for both:
-        - Client initiated connections: This will advertise this server via mDNS as _sendspin-server
-        - Server initiated connections: This will listen for all _sendspin._tcp mDNS services and
-          automatically connect to them.
-
-        :param port: The TCP port to bind the server to.
-        :param host: The IP address for the server to listen on
-            (e.g., "0.0.0.0" for all interfaces).
-        :param advertise_addresses: List of IP addresses to advertise via mDNS.
-            If None, auto-detects the local IP address.
-        :param discover_clients: If True, enable automatic mDNS discovery of clients.
-            If False, the server will still advertise itself and accept incoming connections,
-            but will not actively connect to discovered clients.
-        """
+        """Start the server HTTP listener and (optionally) mDNS discovery/advertising."""
         if self._app is not None:
             logger.warning("Server is already running")
             return
@@ -435,12 +465,12 @@ class SendspinServer:
             )
             await self._tcp_site.start()
             logger.info("Sendspin server started successfully on %s:%d", host, port)
-            # Start mDNS advertise and discovery
+
             self._zc = AsyncZeroconf(
                 ip_version=IPVersion.V4Only,
                 interfaces=[host] if host != "0.0.0.0" else InterfaceChoice.Default,
             )
-            # Determine IP addresses to advertise
+
             if advertise_addresses is not None:
                 addresses = advertise_addresses
             elif local_ip := get_local_ip():
@@ -456,7 +486,7 @@ class SendspinServer:
                 logger.warning(
                     "No IP addresses available for mDNS advertising. "
                     "Clients may not be able to discover this server. "
-                    "Consider specifying addresses manually via advertise_addresses parameter."
+                    "Consider specifying addresses manually via advertise_addresses."
                 )
 
             if discover_clients:
@@ -473,62 +503,53 @@ class SendspinServer:
             raise
 
     async def stop_server(self) -> None:
-        """Stop the HTTP server."""
+        """Stop the server HTTP listener and mDNS services."""
         await self._stop_mdns()
 
         if self._tcp_site:
             await self._tcp_site.stop()
             self._tcp_site = None
-            logger.debug("TCP site stopped")
 
         if self._app_runner:
             await self._app_runner.cleanup()
             self._app_runner = None
-            logger.debug("App runner cleaned up")
 
         if self._app:
             await self._app.shutdown()
             self._app = None
 
     async def close(self) -> None:
-        """Close the server and cleanup resources."""
-        # Cancel all connection tasks to prevent reconnection attempts
+        """Close the server and disconnect all active connections."""
         for task in self._connection_tasks.values():
             task.cancel()
 
-        # Close websockets for pending clients (still in handshake phase)
-        # This allows their handlers to complete and unblock tcp_site.stop()
-        # Use a short timeout to avoid blocking if clients don't respond quickly
-        for client in list(self._pending_clients):
-            wsock = client._wsock_server  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-            if wsock is not None and not wsock.closed:
-                logger.debug("Closing pending client connection")
-                try:
-                    async with asyncio.timeout(1.0):
-                        await wsock.close()
-                except TimeoutError:
-                    logger.debug("Timeout closing pending client websocket")
-                    # Transport will be closed by tcp_site.stop() anyway
+        # Close pending incoming connections so their handlers can exit promptly.
+        for conn in list(self._pending_connections):
+            wsock = conn.websocket_connection
+            if wsock.closed:
+                continue
+            logger.debug("Closing pending client connection")
+            try:
+                async with asyncio.timeout(1.0):
+                    await wsock.close()
+            except TimeoutError:
+                logger.debug("Timeout while closing pending client websocket")
 
-        # Disconnect all clients before stopping the server
-        clients = list(self.clients)
-        disconnect_tasks = []
-        for client in clients:
-            logger.debug("Disconnecting client %s", client.client_id)
-            disconnect_tasks.append(client.disconnect(retry_connection=False))
+        disconnect_tasks: list[asyncio.Task[None]] = []
+        for client in self._clients.values():
+            if client.connection is None:
+                continue
+            disconnect_tasks.append(
+                create_task(client.connection.disconnect(retry_connection=False))
+            )
         if disconnect_tasks:
-            results = await asyncio.gather(*disconnect_tasks, return_exceptions=True)
-            for client, result in zip(clients, results, strict=True):
-                if isinstance(result, Exception):
-                    logger.warning("Error disconnecting client %s: %s", client.client_id, result)
+            await asyncio.gather(*disconnect_tasks, return_exceptions=True)
 
         await self.stop_server()
         if self._owns_session and not self._client_session.closed:
             await self._client_session.close()
-            logger.debug("Closed internal client session for server %s", self._name)
 
     async def _start_mdns_advertising(self, addresses: list[str], port: int, path: str) -> None:
-        """Start advertising this server via mDNS."""
         assert self._zc is not None
         if self._mdns_service is not None:
             await self._zc.async_unregister_service(self._mdns_service)
@@ -552,7 +573,6 @@ class SendspinServer:
             logger.error("Sendspin server with identical name present in the local network!")
 
     async def _start_mdns_discovery(self) -> None:
-        """Automatically connect to Sendspin clients when discovered via mDNS."""
         assert self._zc is not None
 
         service_type = "_sendspin._tcp.local."
@@ -561,7 +581,6 @@ class SendspinServer:
             service_type,
             handlers=[self._on_mdns_service_state_change],
         )
-        logger.debug("mDNS discovery started for clients")
 
     def _on_mdns_service_state_change(
         self,
@@ -570,36 +589,25 @@ class SendspinServer:
         name: str,
         state_change: ServiceStateChange,
     ) -> None:
-        """Handle mDNS service state callback (called from zeroconf thread)."""
         if state_change in (ServiceStateChange.Added, ServiceStateChange.Updated):
 
             def _schedule_add() -> None:
-                task = self._loop.create_task(
-                    self._handle_service_added(zeroconf, service_type, name)
-                )
-                task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                create_task(self._handle_service_added(zeroconf, service_type, name))
 
             self._loop.call_soon_threadsafe(_schedule_add)
         elif state_change is ServiceStateChange.Removed:
             self._loop.call_soon_threadsafe(lambda: self._handle_service_removed(name))
 
     async def _handle_service_added(self, zeroconf: Zeroconf, service_type: str, name: str) -> None:
-        """Handle a new mDNS service being added."""
-        # Try cache first for faster discovery, fall back to network request
         info = AsyncServiceInfo(service_type, name)
         if not info.load_from_cache(zeroconf):
             await info.async_request(zeroconf, 3000)
 
         if not info.parsed_addresses():
-            logger.debug("No addresses found for discovered service %s", name)
             return
 
-        # Filter out link-local and unspecified addresses
         address = _get_first_valid_ip(info.parsed_addresses())
         if address is None:
-            logger.debug(
-                "No valid (non-link-local) addresses found for discovered service %s", name
-            )
             return
 
         port = info.port
@@ -612,40 +620,41 @@ class SendspinServer:
                     break
 
         if port is None:
-            logger.warning("Sendspin client discovered at %s has no port, ignoring", address)
             return
         if path is None or not str(path).startswith("/"):
-            logger.warning(
-                "Sendspin client discovered at %s:%i has no or invalid path property, ignoring",
-                address,
-                port,
-            )
             return
 
         url = f"ws://{address}:{port}{path}"
-        logger.debug("mDNS discovered client at %s", url)
-        # Track the URL for this service so we can disconnect when removed
         self._mdns_client_urls[name] = url
-        try:
-            await self.connect_to_client(url)
-        except (ClientConnectionError, ClientResponseError, TimeoutError) as err:
-            # Log but continue - client may become available later via mDNS update
-            logger.debug("Initial connection to mDNS discovered client at %s failed: %s", url, err)
+        self.connect_to_client(url)
 
     def _handle_service_removed(self, name: str) -> None:
-        """Handle an mDNS service being removed."""
         url = self._mdns_client_urls.pop(name, None)
         if url is not None:
-            logger.debug("mDNS client removed: %s", url)
             self.disconnect_from_client(url)
+            create_task(self._cleanup_retained_clients_for_removed_mdns_url(url))
+
+    async def _cleanup_retained_clients_for_removed_mdns_url(self, url: str) -> None:
+        """Remove retained ANOTHER_SERVER clients when their mDNS URL disappears."""
+        client_ids = [
+            client_id for client_id, known_url in self._client_urls.items() if known_url == url
+        ]
+        for client_id in client_ids:
+            self._client_urls.pop(client_id, None)
+
+        for client_id in client_ids:
+            client = self._clients.get(client_id)
+            if client is None:
+                continue
+
+            if client.cleanup_on_mdns_removal and not client.is_connected:
+                await self.remove_client(client_id)
 
     async def _stop_mdns(self) -> None:
-        """Stop mDNS advertise and discovery if active."""
         if self._zc is None:
             return
         try:
             if self._mdns_browser is not None:
-                # AsyncServiceBrowser cleanup
                 await self._mdns_browser.async_cancel()
             if self._mdns_service is not None:
                 await self._zc.async_unregister_service(self._mdns_service)

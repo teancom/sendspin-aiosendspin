@@ -66,7 +66,7 @@ class ClientListener:
                 The callback receives the WebSocketResponse and should handle
                 the full connection lifecycle (attach to SendspinClient, wait
                 for disconnect, etc.).
-            port: Port to listen on (default: 8927).
+            port: Port to listen on (default: 8928).
             path: WebSocket endpoint path (default: /sendspin).
             host: Host/IP address to bind to (default: 0.0.0.0). Use "127.0.0.1"
                 for local-only access.

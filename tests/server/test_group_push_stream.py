@@ -1,0 +1,350 @@
+"""Tests for SendspinGroup integration with PushStream."""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
+
+import pytest
+
+from aiosendspin.models.types import Roles
+from aiosendspin.server.audio_transformers import TransformerPool
+from aiosendspin.server.channels import MAIN_CHANNEL
+from aiosendspin.server.clock import LoopClock
+from aiosendspin.server.group import SendspinGroup
+from aiosendspin.server.push_stream import PushStream
+
+
+class TestGroupStartStream:
+    """Tests for SendspinGroup.start_stream() integration."""
+
+    @pytest.fixture
+    def mock_loop(self) -> MagicMock:
+        """Create a mock event loop."""
+        loop = MagicMock()
+        loop.time.return_value = 1000.0
+        return loop
+
+    @pytest.fixture
+    def mock_server(self, mock_loop: MagicMock) -> MagicMock:
+        """Create a mock server."""
+        server = MagicMock()
+        server.loop = mock_loop
+        server.clock = LoopClock(mock_loop)
+        return server
+
+    @pytest.fixture
+    def mock_client(self) -> MagicMock:
+        """Create a mock client for the group."""
+        client = MagicMock()
+        client.client_id = "test-client"
+        # This mock client doesn't have the player role
+        client.check_role.return_value = False
+        return client
+
+    def test_start_stream_returns_push_stream(
+        self,
+        mock_server: MagicMock,
+        mock_client: MagicMock,
+    ) -> None:
+        """start_stream() should return a PushStream instance."""
+        group = SendspinGroup(mock_server, mock_client)
+        stream = group.start_stream()
+
+        assert isinstance(stream, PushStream)
+
+    def test_start_stream_uses_group(
+        self,
+        mock_server: MagicMock,
+        mock_client: MagicMock,
+    ) -> None:
+        """start_stream() should bind the PushStream to the group."""
+        group = SendspinGroup(mock_server, mock_client)
+        stream = group.start_stream()
+
+        assert stream._group is group  # noqa: SLF001
+
+    def test_start_stream_uses_server_loop(
+        self,
+        mock_server: MagicMock,
+        mock_client: MagicMock,
+    ) -> None:
+        """start_stream() should use the server's event loop."""
+        group = SendspinGroup(mock_server, mock_client)
+        stream = group.start_stream()
+
+        # The stream should use the server's loop
+        assert stream._loop is mock_server.loop  # noqa: SLF001
+
+    def test_group_stop_stops_stream(
+        self,
+        mock_server: MagicMock,
+        mock_client: MagicMock,
+    ) -> None:
+        """Group stop should call stream stop."""
+        group = SendspinGroup(mock_server, mock_client)
+        stream = group.start_stream()
+
+        assert not stream.is_stopped
+
+        group.stop_stream()
+
+        assert stream.is_stopped
+
+    def test_group_stop_stream_clears_stream_reference(
+        self,
+        mock_server: MagicMock,
+        mock_client: MagicMock,
+    ) -> None:
+        """stop_stream() should clear the group's PushStream reference."""
+        group = SendspinGroup(mock_server, mock_client)
+        group.start_stream()
+
+        group.stop_stream()
+
+        assert group._push_stream is None  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_group_stop_clears_stream_reference(
+        self,
+        mock_server: MagicMock,
+        mock_client: MagicMock,
+    ) -> None:
+        """stop() should clear the group's PushStream reference."""
+        group = SendspinGroup(mock_server, mock_client)
+        group.start_stream()
+
+        await group.stop()
+
+        assert group._push_stream is None  # noqa: SLF001
+
+    def test_multiple_start_stream_returns_new_instances(
+        self,
+        mock_server: MagicMock,
+        mock_client: MagicMock,
+    ) -> None:
+        """Each call to start_stream() should return a new PushStream."""
+        group = SendspinGroup(mock_server, mock_client)
+        stream1 = group.start_stream()
+        stream2 = group.start_stream()
+
+        assert stream1 is not stream2
+
+    def test_start_stream_with_channel_resolver(
+        self,
+        mock_server: MagicMock,
+        mock_client: MagicMock,
+    ) -> None:
+        """start_stream() can accept a custom channel resolver callback."""
+        left_channel = UUID("11111111-1111-1111-1111-111111111111")
+
+        def custom_resolver(player_id: str) -> UUID:
+            if player_id == "left-speaker":
+                return left_channel
+            return MAIN_CHANNEL
+
+        group = SendspinGroup(mock_server, mock_client)
+        group.start_stream(channel_resolver=custom_resolver)
+
+        assert group.get_channel_for_player("left-speaker") == left_channel
+        assert group.get_channel_for_player("other") == MAIN_CHANNEL
+
+
+class TestRoleJoinWithActiveStream:
+    """Tests for roles joining a group with an active PushStream."""
+
+    @pytest.fixture
+    def mock_loop(self) -> MagicMock:
+        """Create a mock event loop."""
+        loop = MagicMock()
+        loop.time.return_value = 1000.0
+        return loop
+
+    @pytest.fixture
+    def mock_server(self, mock_loop: MagicMock) -> MagicMock:
+        """Create a mock server."""
+        server = MagicMock()
+        server.loop = mock_loop
+        server.clock = LoopClock(mock_loop)
+        return server
+
+    @pytest.fixture
+    def mock_owner_client(self) -> MagicMock:
+        """Create a mock owner client for the group."""
+        client = MagicMock()
+        client.client_id = "owner-client"
+        # Owner client doesn't have player role
+        client.check_role.return_value = False
+        client.group = MagicMock()
+        client.group.stop = AsyncMock()
+        return client
+
+    @pytest.fixture
+    def mock_player_client(self) -> MagicMock:
+        """Create a mock player client to join the group."""
+        client = MagicMock()
+        client.client_id = "player-client"
+        # Make check_role return True only for PLAYER role
+        client.check_role.side_effect = lambda role: role == Roles.PLAYER
+        # Mock the group property for ungroup() call
+        client.group = MagicMock()
+        client.group.stop = AsyncMock()
+        client.group._clients = []  # noqa: SLF001
+        client.ungroup = AsyncMock()
+        # Set up a mock role with audio requirements for role-based join
+        mock_role = MagicMock()
+        mock_role.role_family = "player"
+        mock_role.get_audio_requirements.return_value = MagicMock()  # Has audio requirements
+        mock_role.get_player_volume.return_value = 100
+        mock_role.get_player_muted.return_value = False
+        mock_role.set_player_volume = MagicMock()
+        mock_role.set_player_mute = MagicMock()
+        client.active_roles = [mock_role]
+        return client
+
+    @pytest.mark.asyncio
+    async def test_role_join_triggers_on_role_join(
+        self,
+        mock_server: MagicMock,
+        mock_owner_client: MagicMock,
+        mock_player_client: MagicMock,
+    ) -> None:
+        """Adding a client with roles to a group with active stream calls on_role_join."""
+        group = SendspinGroup(mock_server, mock_owner_client)
+        stream = group.start_stream()
+
+        # Mock on_role_join to track calls
+        with patch.object(stream, "on_role_join") as mock_on_role_join:
+            await group.add_client(mock_player_client)
+
+            # Should be called once for each role with audio requirements
+            mock_on_role_join.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_client_without_audio_roles_does_not_trigger_on_role_join(
+        self,
+        mock_server: MagicMock,
+        mock_owner_client: MagicMock,
+    ) -> None:
+        """Adding a client without audio roles does not call on_role_join."""
+        group = SendspinGroup(mock_server, mock_owner_client)
+        stream = group.start_stream()
+
+        # Create a client with no audio-capable roles
+        visualizer_client = MagicMock()
+        visualizer_client.client_id = "visualizer-client"
+        visualizer_client.check_role.return_value = False
+        visualizer_client.group = MagicMock()
+        visualizer_client.group.stop = AsyncMock()
+        visualizer_client.group._clients = []  # noqa: SLF001
+        visualizer_client.ungroup = AsyncMock()
+        # No roles with audio requirements
+        mock_role = MagicMock()
+        mock_role.get_audio_requirements.return_value = None
+        visualizer_client.active_roles = [mock_role]
+
+        with patch.object(stream, "on_role_join") as mock_on_role_join:
+            await group.add_client(visualizer_client)
+
+            mock_on_role_join.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_client_join_without_active_stream(
+        self,
+        mock_server: MagicMock,
+        mock_owner_client: MagicMock,
+        mock_player_client: MagicMock,
+    ) -> None:
+        """Adding a client without an active stream does not crash."""
+        group = SendspinGroup(mock_server, mock_owner_client)
+        # No stream started
+
+        # Should not raise
+        await group.add_client(mock_player_client)
+
+    @pytest.mark.asyncio
+    async def test_client_join_with_stopped_stream(
+        self,
+        mock_server: MagicMock,
+        mock_owner_client: MagicMock,
+        mock_player_client: MagicMock,
+    ) -> None:
+        """Adding a client to a stopped stream does not call on_role_join."""
+        group = SendspinGroup(mock_server, mock_owner_client)
+        stream = group.start_stream()
+        stream.stop()  # Stop the stream
+
+        with patch.object(stream, "on_role_join") as mock_on_role_join:
+            await group.add_client(mock_player_client)
+
+            mock_on_role_join.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_remove_client_uses_role_stream_end_hook(
+        self,
+        mock_server: MagicMock,
+        mock_owner_client: MagicMock,
+        mock_player_client: MagicMock,
+    ) -> None:
+        """remove_client() should call role.on_stream_end() for removed client roles."""
+        group = SendspinGroup(mock_server, mock_owner_client)
+        await group.add_client(mock_player_client)
+        group.start_stream()
+
+        role = mock_player_client.active_roles[0]
+        role.on_stream_end.reset_mock()
+
+        await group.remove_client(mock_player_client)
+
+        role.on_stream_end.assert_called_once()
+
+
+class TestGroupTransformerPool:
+    """Tests for SendspinGroup.transformer_pool property."""
+
+    @pytest.fixture
+    def mock_loop(self) -> MagicMock:
+        """Create a mock event loop."""
+        loop = MagicMock()
+        loop.time.return_value = 1000.0
+        return loop
+
+    @pytest.fixture
+    def mock_server(self, mock_loop: MagicMock) -> MagicMock:
+        """Create a mock server."""
+        server = MagicMock()
+        server.loop = mock_loop
+        server.clock = LoopClock(mock_loop)
+        return server
+
+    @pytest.fixture
+    def mock_client(self) -> MagicMock:
+        """Create a mock client for the group."""
+        client = MagicMock()
+        client.client_id = "test-client"
+        # This mock client doesn't have the player role
+        client.check_role.return_value = False
+        return client
+
+    def test_group_has_transformer_pool(
+        self,
+        mock_server: MagicMock,
+        mock_client: MagicMock,
+    ) -> None:
+        """SendspinGroup exposes a transformer_pool."""
+        group = SendspinGroup(mock_server, mock_client)
+
+        assert isinstance(group.transformer_pool, TransformerPool)
+
+    def test_transformer_pool_is_same_instance(
+        self,
+        mock_server: MagicMock,
+        mock_client: MagicMock,
+    ) -> None:
+        """transformer_pool returns the same instance on multiple accesses."""
+        group = SendspinGroup(mock_server, mock_client)
+
+        pool1 = group.transformer_pool
+        pool2 = group.transformer_pool
+
+        assert pool1 is pool2

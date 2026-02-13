@@ -9,7 +9,7 @@ synchronization, stream lifecycle management, and role-based state updates and c
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Annotated, Any, Literal
 
 from mashumaro.config import BaseConfig
@@ -45,6 +45,19 @@ from .visualizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _merge_optional_dataclass_fields(existing: Any, incoming: Any) -> Any:
+    """Merge dataclass instances by preferring non-None incoming field values."""
+    merged_values = {
+        field.name: (
+            incoming_value
+            if (incoming_value := getattr(incoming, field.name)) is not None
+            else getattr(existing, field.name)
+        )
+        for field in fields(existing)
+    }
+    return type(existing)(**merged_values)
 
 
 # This server implementation accidentally used incorrect field names (player_support, etc.)
@@ -86,8 +99,8 @@ class ClientHelloPayload(DataClassORJSONMixin):
     """Friendly name of the client."""
     version: int
     """Version that the Sendspin client implements."""
-    supported_roles: list[Roles]
-    """List of roles the client supports."""
+    supported_roles: list[str]
+    """List of versioned role IDs the client supports (e.g., 'player@v1')."""
     device_info: DeviceInfo | None = None
     """Optional information about the device."""
     player_support: Annotated[ClientHelloPlayerSupport | None, Alias("player@v1_support")] = None
@@ -110,7 +123,7 @@ class ClientHelloPayload(DataClassORJSONMixin):
         if legacy_fields_used:
             old_names = ", ".join(old for old, _ in legacy_fields_used)
             new_names = ", ".join(new for _, new in legacy_fields_used)
-            logger.info(
+            logger.warning(
                 "client/hello message used deprecated field names (%s), "
                 "please update client to use (%s) instead",
                 old_names,
@@ -121,28 +134,34 @@ class ClientHelloPayload(DataClassORJSONMixin):
     def __post_init__(self) -> None:
         """Enforce that support configs match supported roles."""
         # Validate player role and support configuration
-        player_role_supported = Roles.PLAYER in self.supported_roles
+        # Require support objects only for the exact role version we parse (e.g. "player@v1").
+        # Clients may advertise newer versions (e.g. "player@v2") which this server may not
+        # implement. Those must not trigger v1 support requirements.
+        player_role_supported = Roles.PLAYER.value in self.supported_roles
         if player_role_supported and self.player_support is None:
             raise ValueError(
-                "player_support must be provided when 'player' role is in supported_roles"
+                "player@v1_support (player_support alias) must be provided when "
+                "'player@v1' is in supported_roles"
             )
         if not player_role_supported:
             self.player_support = None
 
         # Validate artwork role and support configuration
-        artwork_role_supported = Roles.ARTWORK in self.supported_roles
+        artwork_role_supported = Roles.ARTWORK.value in self.supported_roles
         if artwork_role_supported and self.artwork_support is None:
             raise ValueError(
-                "artwork_support must be provided when 'artwork' role is in supported_roles"
+                "artwork@v1_support (artwork_support alias) must be provided when "
+                "'artwork@v1' is in supported_roles"
             )
         if not artwork_role_supported:
             self.artwork_support = None
 
         # Validate visualizer role and support configuration
-        visualizer_role_supported = Roles.VISUALIZER in self.supported_roles
+        visualizer_role_supported = Roles.VISUALIZER.value in self.supported_roles
         if visualizer_role_supported and self.visualizer_support is None:
             raise ValueError(
-                "visualizer_support must be provided when 'visualizer' role is in supported_roles"
+                "visualizer@v1_support (visualizer_support alias) must be provided when "
+                "'visualizer@v1' is in supported_roles"
             )
         if not visualizer_role_supported:
             self.visualizer_support = None
@@ -260,8 +279,8 @@ class ServerHelloPayload(DataClassORJSONMixin):
     """Friendly name of the server"""
     version: int
     """Version of the core message format (independent of role versions)."""
-    active_roles: list[Roles]
-    """Versioned roles that are active for this client (e.g., player@v1, controller@v1)."""
+    active_roles: list[str]
+    """Versioned role IDs active for this client (e.g., 'player@v1', 'controller@v1')."""
     connection_reason: ConnectionReason
     """Reason for this connection (relevant for multi-server environments)."""
 
@@ -318,6 +337,13 @@ class ServerStateMessage(ServerMessage):
     payload: ServerStatePayload
     type: Literal["server/state"] = "server/state"
 
+    def merge(self, other: ServerMessage) -> ServerMessage | None:
+        """Merge with another server/state message, preferring non-null incoming fields."""
+        if not isinstance(other, ServerStateMessage):
+            return None
+
+        return ServerStateMessage(_merge_optional_dataclass_fields(self.payload, other.payload))
+
 
 # Server -> Client: group/update
 @dataclass
@@ -343,6 +369,14 @@ class GroupUpdateServerMessage(ServerMessage):
 
     payload: GroupUpdateServerPayload
     type: Literal["group/update"] = "group/update"
+
+    def merge(self, other: ServerMessage) -> ServerMessage | None:
+        """Merge with another group/update message, preferring defined incoming fields."""
+        if not isinstance(other, GroupUpdateServerMessage):
+            return None
+
+        merged_payload = _merge_optional_dataclass_fields(self.payload, other.payload)
+        return GroupUpdateServerMessage(merged_payload)
 
 
 # Server -> Client: server/command
@@ -393,8 +427,11 @@ class StreamStartMessage(ServerMessage):
     type: Literal["stream/start"] = "stream/start"
 
 
-# Roles that support stream/clear (have buffers to clear)
-STREAM_CLEAR_ROLES = frozenset({Roles.PLAYER, Roles.VISUALIZER})
+# Role family names that support stream/clear (have buffers to clear).
+STREAM_CLEAR_ROLE_FAMILIES = frozenset({"player", "visualizer"})
+
+# Role family names that support stream/end.
+STREAM_END_ROLE_FAMILIES = frozenset({"player", "artwork", "visualizer"})
 
 
 # Server -> Client: stream/clear
@@ -402,17 +439,18 @@ STREAM_CLEAR_ROLES = frozenset({Roles.PLAYER, Roles.VISUALIZER})
 class StreamClearPayload(DataClassORJSONMixin):
     """Instructs clients to clear buffers without ending the stream."""
 
-    roles: list[Roles] | None = None
+    roles: list[str] | None = None
     """Roles to clear: player, visualizer, or both. If omitted, clears both roles."""
 
     def __post_init__(self) -> None:
-        """Validate that only player and visualizer roles are specified."""
+        """Validate that only player and visualizer role families are specified."""
         if self.roles is not None:
-            invalid_roles = set(self.roles) - STREAM_CLEAR_ROLES
+            invalid_roles = set(self.roles) - STREAM_CLEAR_ROLE_FAMILIES
             if invalid_roles:
+                supported = sorted(STREAM_CLEAR_ROLE_FAMILIES)
+                invalid = sorted(invalid_roles)
                 raise ValueError(
-                    f"stream/clear only supports roles {[r.value for r in STREAM_CLEAR_ROLES]}, "
-                    f"got invalid roles: {[r.value for r in invalid_roles]}"
+                    f"stream/clear only supports roles {supported}, got invalid roles: {invalid}"
                 )
 
     class Config(BaseConfig):
@@ -458,8 +496,19 @@ class StreamRequestFormatMessage(ClientMessage):
 class StreamEndPayload(DataClassORJSONMixin):
     """Payload for stream/end message."""
 
-    roles: list[Roles] | None = None
+    roles: list[str] | None = None
     """Roles to end streams for. If omitted, ends all active streams."""
+
+    def __post_init__(self) -> None:
+        """Validate that only known role families are specified."""
+        if self.roles is not None:
+            invalid_roles = set(self.roles) - STREAM_END_ROLE_FAMILIES
+            if invalid_roles:
+                supported = sorted(STREAM_END_ROLE_FAMILIES)
+                invalid = sorted(invalid_roles)
+                raise ValueError(
+                    f"stream/end only supports roles {supported}, got invalid roles: {invalid}"
+                )
 
     class Config(BaseConfig):
         """Config for parsing json messages."""
