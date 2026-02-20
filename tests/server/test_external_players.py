@@ -10,20 +10,19 @@ import pytest
 from aiosendspin.models.core import ClientHelloPayload
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
 from aiosendspin.models.types import (
-    SUPPORTED_ROLE_VERSIONS,
     AudioCodec,
     BinaryMessageType,
     ConnectionReason,
     PlayerCommand,
     Roles,
 )
+from aiosendspin.server import ExternalStreamStartRequest, SendspinServer
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.client import SendspinClient
 from aiosendspin.server.group import SendspinGroup
 from aiosendspin.server.roles.base import AudioChunk, AudioRequirements, Role
 from aiosendspin.server.roles.player.v1 import PlayerPersistentState
 from aiosendspin.server.roles.registry import ROLE_FACTORIES
-from aiosendspin.server.server import ExternalStreamStartRequest, SendspinServer
 
 
 class _DummyConnection:
@@ -270,7 +269,6 @@ async def test_cold_preinitialized_custom_role_can_receive_audio_without_warm_fl
         def on_audio_chunk(self, chunk: AudioChunk) -> None:
             self._chunks.append(chunk)
 
-    monkeypatch.setitem(SUPPORTED_ROLE_VERSIONS, "customaudio", "customaudio@v1")
     monkeypatch.setitem(ROLE_FACTORIES, "customaudio@v1", lambda client: _CustomAudioRole(client))
 
     server = _make_server()
