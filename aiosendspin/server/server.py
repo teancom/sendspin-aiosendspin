@@ -659,7 +659,10 @@ class SendspinServer:
             await self._zc.async_unregister_service(self._mdns_service)
 
         service_type = "_sendspin-server._tcp.local."
-        properties = {"path": path}
+        properties: dict[str, str] = {}
+        if self._name:
+            properties["name"] = self._name
+        properties["path"] = path
 
         info = AsyncServiceInfo(
             type_=service_type,
