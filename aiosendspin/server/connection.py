@@ -653,7 +653,7 @@ class SendspinConnection:
                 else ConnectionReason.DISCOVERY
             )
 
-            self.send_message(
+            self.send_priority_message(
                 ServerHelloMessage(
                     payload=ServerHelloPayload(
                         server_id=self._server.id,
