@@ -161,15 +161,15 @@ class TestConnectionSendsCorrectReason:
         # Create a connection with URL but no stored reason
         conn = SendspinConnection(mock_server, wsock_client=AsyncMock(), url=url)
 
-        # Capture messages sent via the connection
+        # Capture priority messages — server/hello must use the priority queue
         sent_messages: list[ServerMessage] = []
-        original_send = conn.send_message
+        original_priority_send = conn.send_priority_message
 
-        def capture_send(msg: ServerMessage) -> None:
+        def capture_priority_send(msg: ServerMessage) -> None:
             sent_messages.append(msg)
-            original_send(msg)
+            original_priority_send(msg)
 
-        conn.send_message = capture_send  # type: ignore[method-assign]
+        conn.send_priority_message = capture_priority_send  # type: ignore[method-assign]
 
         # Simulate receiving client/hello
         await conn._handle_message(  # noqa: SLF001
@@ -191,15 +191,15 @@ class TestConnectionSendsCorrectReason:
 
         conn = SendspinConnection(mock_server, wsock_client=AsyncMock(), url=url)
 
-        # Capture messages sent via the connection
+        # Capture priority messages — server/hello must use the priority queue
         sent_messages: list[ServerMessage] = []
-        original_send = conn.send_message
+        original_priority_send = conn.send_priority_message
 
-        def capture_send(msg: ServerMessage) -> None:
+        def capture_priority_send(msg: ServerMessage) -> None:
             sent_messages.append(msg)
-            original_send(msg)
+            original_priority_send(msg)
 
-        conn.send_message = capture_send  # type: ignore[method-assign]
+        conn.send_priority_message = capture_priority_send  # type: ignore[method-assign]
 
         await conn._handle_message(  # noqa: SLF001
             ClientHelloMessage(payload=_player_hello("client-1")),
@@ -220,15 +220,15 @@ class TestConnectionSendsCorrectReason:
         conn._wsock_server = AsyncMock()  # noqa: SLF001
         conn._wsock_server.closed = False  # noqa: SLF001
 
-        # Capture messages sent via the connection
+        # Capture priority messages — server/hello must use the priority queue
         sent_messages: list[ServerMessage] = []
-        original_send = conn.send_message
+        original_priority_send = conn.send_priority_message
 
-        def capture_send(msg: ServerMessage) -> None:
+        def capture_priority_send(msg: ServerMessage) -> None:
             sent_messages.append(msg)
-            original_send(msg)
+            original_priority_send(msg)
 
-        conn.send_message = capture_send  # type: ignore[method-assign]
+        conn.send_priority_message = capture_priority_send  # type: ignore[method-assign]
 
         await conn._handle_message(  # noqa: SLF001
             ClientHelloMessage(payload=_player_hello("client-1")),
