@@ -440,7 +440,9 @@ class SendspinConnection:
                 await wsock.close()
 
         if self._client is not None:
-            self._client.detach_connection(self._last_goodbye_reason)
+            # Only detach if this connection is still the active one.
+            if self._client.connection is self:
+                self._client.detach_connection(self._last_goodbye_reason)
             self._client = None
 
         self._logger.debug("Connection disconnected")
