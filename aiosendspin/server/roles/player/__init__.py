@@ -6,6 +6,7 @@ from aiosendspin.server.roles.player.events import (
     PlayerGroupEvent,
     PlayerGroupMuteChangedEvent,
     PlayerGroupVolumeChangedEvent,
+    StaticDelayChangedEvent,
     VolumeChangedEvent,
 )
 from aiosendspin.server.roles.player.group import PlayerGroupRole
@@ -36,5 +37,6 @@ __all__ = [
     "PlayerGroupVolumeChangedEvent",
     "PlayerRoleProtocol",
     "PlayerV1Role",
+    "StaticDelayChangedEvent",
     "VolumeChangedEvent",
 ]

@@ -51,6 +51,7 @@ from aiosendspin.models.types import (
     ConnectionReason,
     GoodbyeReason,
     MediaCommand,
+    PlayerCommand,
     PlayerStateType,
     Roles,
     ServerMessage,
@@ -251,6 +252,8 @@ class SendspinClient:
     """Initial volume level for player role (0-100)."""
     _initial_muted: bool
     """Initial mute state for player role."""
+    _state_supported_commands: list[PlayerCommand]
+    """Supported commands advertised in client/state messages."""
 
     def __init__(  # noqa: PLR0913
         self,
@@ -266,6 +269,7 @@ class SendspinClient:
         static_delay_ms: float = 0.0,
         initial_volume: int = 100,
         initial_muted: bool = False,
+        state_supported_commands: list[PlayerCommand] | None = None,
     ) -> None:
         """
         Create a new Sendspin client instance.
@@ -293,6 +297,8 @@ class SendspinClient:
                 role is supported.
             initial_muted: Initial mute state for player role. Defaults to False.
                 Sent automatically after handshake if PLAYER role is supported.
+            state_supported_commands: Optional list of player commands advertised
+                in client/state messages. Defaults to None (empty list).
 
         Raises:
             ValueError: If PLAYER in roles but player_support is None, if
@@ -335,6 +341,7 @@ class SendspinClient:
         self._initial_volume = initial_volume
         self._initial_muted = initial_muted
         self.set_static_delay_ms(static_delay_ms)
+        self._state_supported_commands: list[PlayerCommand] = list(state_supported_commands or [])
 
         # Initialize callback lists
         self._metadata_callbacks = []
@@ -367,6 +374,7 @@ class SendspinClient:
 
     def set_static_delay_ms(self, delay_ms: float) -> None:
         """Update the static playback delay applied after clock synchronisation."""
+        delay_ms = max(0.0, min(5000.0, delay_ms))
         delay_us = round(delay_ms * 1_000.0)
         if delay_us == self._static_delay_us:
             return
@@ -490,7 +498,13 @@ class SendspinClient:
             raise RuntimeError("Client is not connected")
         message = ClientStateMessage(
             payload=ClientStatePayload(
-                player=PlayerStatePayload(state=state, volume=volume, muted=muted)
+                player=PlayerStatePayload(
+                    state=state,
+                    volume=volume,
+                    muted=muted,
+                    static_delay_ms=round(self._static_delay_us / 1_000),
+                    supported_commands=self._state_supported_commands or None,
+                )
             )
         )
         await self._send_message(message.to_json())
@@ -930,6 +944,13 @@ class SendspinClient:
 
     def _handle_server_command(self, payload: ServerCommandPayload) -> None:
         """Handle server/command message."""
+        if payload.player is not None:
+            player_cmd = payload.player
+            if (
+                player_cmd.command == PlayerCommand.SET_STATIC_DELAY
+                and player_cmd.static_delay_ms is not None
+            ):
+                self.set_static_delay_ms(float(player_cmd.static_delay_ms))
         self._notify_server_command_callback(payload)
 
     def _configure_audio_output(self, audio_format: AudioFormat) -> None:
@@ -1063,28 +1084,27 @@ class SendspinClient:
         Convert server timestamp to client play time with static delay applied.
 
         This method converts a server timestamp to the equivalent client timestamp
-        (based on monotonic loop time) and adds the configured static delay.
+        (based on monotonic loop time) and subtracts the configured static delay.
         Use this to determine when audio should be played on the client.
 
         Args:
             server_timestamp_us: Server timestamp in microseconds.
 
         Returns:
-            Client play time in microseconds (monotonic loop time + static delay).
+            Client play time in microseconds (monotonic loop time - static delay).
         """
         if self._time_filter.is_synchronized:
             client_time = self._time_filter.compute_client_time(server_timestamp_us)
-            return client_time + self._static_delay_us
-        # Fallback: add a conservative delay if time sync isn't ready yet
-        return self._now_us() + 500_000 + self._static_delay_us
+            return client_time - self._static_delay_us
+        return self._now_us() + 500_000 - self._static_delay_us
 
     def compute_server_time(self, client_timestamp_us: int) -> int:
         """
         Convert client timestamp to server timestamp with static delay removed.
 
         This is the inverse of compute_play_time. It converts a client timestamp
-        (monotonic loop time) to the equivalent server timestamp, removing the
-        static delay first.
+        (monotonic loop time) to the equivalent server timestamp, adding the
+        static delay back first.
 
         Args:
             client_timestamp_us: Client timestamp in microseconds (monotonic loop time).
@@ -1092,8 +1112,8 @@ class SendspinClient:
         Returns:
             Server timestamp in microseconds.
         """
-        # Remove static delay first, then convert to server time
-        adjusted_client_time = client_timestamp_us - self._static_delay_us
+        # Add static delay back, then convert to server time
+        adjusted_client_time = client_timestamp_us + self._static_delay_us
         return self._time_filter.compute_server_time(adjusted_client_time)
 
     def _notify_metadata_callback(self, payload: ServerStatePayload) -> None:
