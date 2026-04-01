@@ -327,6 +327,8 @@ class PlayerV1Role(Role):
         message_type = BinaryMessageType.AUDIO_CHUNK.value
         header = pack_binary_header_raw(message_type, chunk.timestamp_us)
         packed_data = header + chunk.data
+        # Compute the wall-clock buffer horizon (effective play time) by shifting
+        # the chunk's end time earlier by the configured static delay.
         static_delay_us = self.static_delay_ms * 1_000
         chunk_end_us = chunk.timestamp_us + chunk.duration_us - static_delay_us
 
@@ -427,6 +429,10 @@ class PlayerV1Role(Role):
     def set_player_mute(self, muted: bool) -> None:  # noqa: FBT001
         """Set player mute via role API."""
         self.set_mute(muted)
+
+    def get_static_delay_us(self) -> int:
+        """Return transport delay in microseconds for timestamp offsetting."""
+        return max(self.static_delay_ms, 0) * 1_000
 
     def get_static_delay_ms(self) -> int:
         """Return static delay for protocol API."""
