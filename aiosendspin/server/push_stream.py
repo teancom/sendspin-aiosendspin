@@ -26,9 +26,9 @@ from aiosendspin.util import create_task
 if TYPE_CHECKING:
     import av
 
+    from aiosendspin.clock import Clock
     from aiosendspin.server.audio_transformers import AudioTransformer
     from aiosendspin.server.client import SendspinClient
-    from aiosendspin.server.clock import Clock
     from aiosendspin.server.group import SendspinGroup
     from aiosendspin.server.roles import AudioRequirements, Role
 
@@ -335,6 +335,10 @@ class PushStream:
         self._historical_buffers: dict[UUID, list[tuple[bytes, AudioFormat]]] = {}
         # Optional start timestamps for historical channels (set on first historical chunk).
         self._historical_start_us: dict[UUID, int] = {}
+
+    def now_us(self) -> int:
+        """Return current timestamp from the stream's clock in microseconds."""
+        return self._clock.now_us()
 
     @property
     def is_stopped(self) -> bool:
