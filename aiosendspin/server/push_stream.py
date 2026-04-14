@@ -9,13 +9,17 @@ import logging
 import weakref
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from errno import EAGAIN
+from functools import lru_cache
+from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, cast
 from uuid import UUID
 
 from aiosendspin.server.audio import (
     AudioFormat,
+    _convert_s24_to_s32,
     _convert_s32_to_s24,
     _get_av,
+    _validate_pcm_buffer_length,
 )
 from aiosendspin.server.audio_transformers import TransformKey, normalize_options
 from aiosendspin.server.channels import MAIN_CHANNEL
@@ -39,10 +43,155 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_INITIAL_DELAY_US = 250_000  # 250ms
 # Pre-roll amount for catch-up encoding to absorb codec startup delay.
 ENCODER_CATCHUP_WARMUP_US = 120_000
+# Dithering policy when reducing to 16-bit integer PCM.
+_DITHER_METHOD_TRIANGULAR_HP = "triangular_hp"
 # Maximum allowed drift between transformer's internal timeline and the expected output
 # timestamp before we discard the transformer's timeline. Normal codec buffering delays are
 # < 100ms; this threshold catches the accumulated drift from timeline rebasing.
 _TRANSFORMER_DRIFT_THRESHOLD_US = 500_000  # 500ms
+
+
+class _AudioFilterGraph(Protocol):
+    """Subset of PyAV filter graph API used by PushStream."""
+
+    def push(self, frame: av.AudioFrame | None) -> None:
+        """Push one audio frame into the graph, or None to signal EOF/flush."""
+        ...
+
+    def pull(self) -> av.AudioFrame:
+        """Pull one audio frame from the graph sink."""
+        ...
+
+
+def _drain_audio_graph(graph: _AudioFilterGraph) -> list[av.AudioFrame]:
+    """Pull all currently available audio frames from a configured filter graph."""
+    out_frames: list[av.AudioFrame] = []
+    while True:
+        try:
+            out_frames.append(graph.pull())
+        except EOFError:
+            break
+        except OSError as exc:  # pragma: no cover - depends on FFmpeg/PyAV build details
+            if exc.errno == EAGAIN:
+                break
+            raise
+    return out_frames
+
+
+@lru_cache(maxsize=1)
+def _supports_soxr_resampler() -> bool:
+    """Return True when this runtime FFmpeg build supports libsoxr in aresample."""
+    av = _get_av()
+
+    graph = av.filter.Graph()
+    try:
+        graph.link_nodes(
+            graph.add_abuffer(format="s16", sample_rate=48_000, layout="stereo"),
+            graph.add("aresample", "resampler=soxr:precision=30"),
+            graph.add("abuffersink"),
+        ).configure()
+    except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover
+        _LOGGER.debug("libsoxr not available for aresample; using swr fallback: %s", exc)
+        return False
+    return True
+
+
+# Tracks format combos where soxr graph construction failed, to avoid retrying.
+_soxr_failed_configs: set[tuple[str, str, int, str, str, int]] = set()
+
+
+def _assemble_resample_graph(
+    *,
+    source_av_format: str,
+    source_layout: str,
+    source_sample_rate: int,
+    target_av_format: str,
+    target_layout: str,
+    target_sample_rate: int,
+    aresample_args: str,
+) -> _AudioFilterGraph:
+    """Build and configure a PyAV graph for one resampling configuration."""
+    av = _get_av()
+
+    graph = av.filter.Graph()
+    graph.link_nodes(
+        graph.add_abuffer(
+            format=source_av_format,
+            sample_rate=source_sample_rate,
+            layout=source_layout,
+        ),
+        graph.add("aresample", aresample_args),
+        graph.add(
+            "aformat",
+            (
+                f"sample_fmts={target_av_format}:"
+                f"sample_rates={target_sample_rate}:"
+                f"channel_layouts={target_layout}"
+            ),
+        ),
+        graph.add("abuffersink"),
+    ).configure()
+    return cast("_AudioFilterGraph", graph)
+
+
+def _build_resample_graph(
+    *,
+    source_av_format: str,
+    source_layout: str,
+    source_sample_rate: int,
+    target_av_format: str,
+    target_layout: str,
+    target_sample_rate: int,
+    dither_method: str | None = None,
+) -> _AudioFilterGraph:
+    """Create an audio filter graph for resampling with soxr (or swr fallback)."""
+    config_key = (
+        source_av_format,
+        source_layout,
+        source_sample_rate,
+        target_av_format,
+        target_layout,
+        target_sample_rate,
+    )
+    use_soxr = _supports_soxr_resampler() and config_key not in _soxr_failed_configs
+
+    preferred_resampler = "resampler=soxr:precision=30" if use_soxr else "resampler=swr"
+    preferred_aresample = (
+        preferred_resampler
+        if dither_method is None
+        else f"{preferred_resampler}:osf={target_av_format}:dither_method={dither_method}"
+    )
+
+    try:
+        return _assemble_resample_graph(
+            source_av_format=source_av_format,
+            source_layout=source_layout,
+            source_sample_rate=source_sample_rate,
+            target_av_format=target_av_format,
+            target_layout=target_layout,
+            target_sample_rate=target_sample_rate,
+            aresample_args=preferred_aresample,
+        )
+    except (OSError, RuntimeError, ValueError):
+        if not use_soxr:
+            raise
+
+    _soxr_failed_configs.add(config_key)
+    _LOGGER.warning("Falling back to swr resampler after soxr graph setup failure")
+    fallback_aresample = (
+        "resampler=swr"
+        if dither_method is None
+        else f"resampler=swr:osf={target_av_format}:dither_method={dither_method}"
+    )
+    return _assemble_resample_graph(
+        source_av_format=source_av_format,
+        source_layout=source_layout,
+        source_sample_rate=source_sample_rate,
+        target_av_format=target_av_format,
+        target_layout=target_layout,
+        target_sample_rate=target_sample_rate,
+        aresample_args=fallback_aresample,
+    )
 
 
 def _encode_for_transform_key(
@@ -83,6 +232,8 @@ class _ResamplerKey(NamedTuple):
     target_sample_rate: int
     target_channels: int
     target_bit_depth: int
+    target_sample_type: Literal["int", "float"] = "int"
+    dither_method: str | None = None
 
 
 @dataclass
@@ -91,12 +242,16 @@ class _ResamplerState:
 
     key: _ResamplerKey
     """Resampler key for identification."""
-    resampler: av.AudioResampler
-    """PyAV audio resampler."""
+    graph: _AudioFilterGraph | None
+    """PyAV audio filter graph used for resampling. None for passthrough."""
     source_av_format: str
     """PyAV format string for source."""
     source_av_layout: str
     """PyAV channel layout for source."""
+    source_sample_rate: int
+    """Source sample rate used when configuring the filter graph."""
+    source_av_frame_stride: int
+    """Bytes per frame in PyAV representation for source PCM."""
     target_av_format: str
     """PyAV format string for target (after resampling)."""
     target_layout: str
@@ -109,6 +264,13 @@ class _ResamplerState:
     """True when resampler output is s32 but wire PCM is packed s24."""
     pending_timestamp_us: int | None = None
     """Timestamp of the earliest audio sample not yet emitted by this resampler."""
+    is_passthrough: bool = False
+    """True when source and target formats are identical — skip graph processing."""
+
+    @property
+    def target_sample_type(self) -> Literal["int", "float"]:
+        """PCM sample type produced by this resampler."""
+        return "float" if self.target_av_format == "flt" else "int"
 
 
 @dataclass(frozen=True)
@@ -119,6 +281,7 @@ class _ResampledPCM:
     output_start_ts: int
     sample_count: int
     needs_s32_to_s24_conversion: bool
+    sample_type: Literal["int", "float"]
 
 
 def _create_resampler_state(
@@ -127,8 +290,6 @@ def _create_resampler_state(
     target_format: AudioFormat,
 ) -> _ResamplerState:
     """Create a new resampler state. Thread-safe (no shared state)."""
-    av = _get_av()
-
     _source_wire_bytes, source_av_format, source_layout, _source_av_bytes = (
         source_format.resolve_av_format()
     )
@@ -136,24 +297,45 @@ def _create_resampler_state(
         target_format.resolve_av_format()
     )
 
-    resampler = av.AudioResampler(
-        format=target_av_format,
-        layout=target_layout,
-        rate=target_format.sample_rate,
+    needs_s32_to_s24 = (
+        target_format.sample_type == "int"
+        and target_format.bit_depth == 24
+        and target_av_bytes != target_wire_bytes
     )
+
+    is_passthrough = (
+        source_format.sample_rate == target_format.sample_rate
+        and source_format.channels == target_format.channels
+        and source_format.bit_depth == target_format.bit_depth
+        and source_format.sample_type == target_format.sample_type
+        and key.dither_method is None
+    )
+
+    graph: _AudioFilterGraph | None = None
+    if not is_passthrough:
+        graph = _build_resample_graph(
+            source_av_format=source_av_format,
+            source_layout=source_layout,
+            source_sample_rate=source_format.sample_rate,
+            target_av_format=target_av_format,
+            target_layout=target_layout,
+            target_sample_rate=target_format.sample_rate,
+            dither_method=key.dither_method,
+        )
 
     return _ResamplerState(
         key=key,
-        resampler=resampler,
+        graph=graph,
         source_av_format=source_av_format,
         source_av_layout=source_layout,
+        source_sample_rate=source_format.sample_rate,
+        source_av_frame_stride=_source_av_bytes * source_format.channels,
         target_av_format=target_av_format,
         target_layout=target_layout,
         target_wire_frame_stride=target_wire_bytes * target_format.channels,
         target_av_frame_stride=target_av_bytes * target_format.channels,
-        needs_s32_to_s24_conversion=(
-            target_format.bit_depth == 24 and target_av_bytes != target_wire_bytes
-        ),
+        needs_s32_to_s24_conversion=needs_s32_to_s24,
+        is_passthrough=is_passthrough,
     )
 
 
@@ -185,17 +367,42 @@ def _resample_pcm_standalone(
         # Resync if timestamp drifts too far (e.g., resampler was idle)
         drift_us = abs(resampler_state.pending_timestamp_us - input_timestamp_us)
         if drift_us > 20_000:
+            # Flush the old graph to release FIR filter tails cleanly.
+            # Flushed samples are discarded — they belong to the stale timeline.
+            if resampler_state.graph is not None:
+                try:
+                    resampler_state.graph.push(None)
+                    _drain_audio_graph(resampler_state.graph)
+                except (EOFError, OSError):
+                    pass
+                resampler_state.graph = _build_resample_graph(
+                    source_av_format=resampler_state.source_av_format,
+                    source_layout=resampler_state.source_av_layout,
+                    source_sample_rate=resampler_state.source_sample_rate,
+                    target_av_format=resampler_state.target_av_format,
+                    target_layout=resampler_state.target_layout,
+                    target_sample_rate=resampler_state.key.target_sample_rate,
+                    dither_method=resampler_state.key.dither_method,
+                )
             resampler_state.pending_timestamp_us = input_timestamp_us
-            resampler_state.resampler = av.AudioResampler(
-                format=resampler_state.target_av_format,
-                layout=resampler_state.target_layout,
-                rate=resampler_state.key.target_sample_rate,
-            )
 
     # Calculate sample count from input
     bytes_per_sample = source_format.bit_depth // 8
     frame_stride = bytes_per_sample * source_format.channels
+    if len(source_pcm) % frame_stride != 0:
+        msg = (
+            f"source PCM buffer length {len(source_pcm)} does not align to "
+            f"{frame_stride}-byte frames"
+        )
+        raise ValueError(msg)
     sample_count = len(source_pcm) // frame_stride
+    av_input_pcm = (
+        _convert_s24_to_s32(source_pcm)
+        if source_format.sample_type == "int"
+        and source_format.bit_depth == 24
+        and resampler_state.source_av_format == "s32"
+        else source_pcm
+    )
 
     if sample_count == 0:
         return _ResampledPCM(
@@ -203,19 +410,41 @@ def _resample_pcm_standalone(
             output_start_ts=resampler_state.pending_timestamp_us,
             sample_count=0,
             needs_s32_to_s24_conversion=resampler_state.needs_s32_to_s24_conversion,
+            sample_type=resampler_state.target_sample_type,
         )
 
+    # Fast path: no conversion needed — return input PCM with timestamp tracking
+    if resampler_state.is_passthrough:
+        output_start_ts = resampler_state.pending_timestamp_us
+        duration_us = int(sample_count * 1_000_000 / resampler_state.key.target_sample_rate)
+        resampler_state.pending_timestamp_us += duration_us
+        return _ResampledPCM(
+            pcm_data=av_input_pcm,
+            output_start_ts=output_start_ts,
+            sample_count=sample_count,
+            needs_s32_to_s24_conversion=resampler_state.needs_s32_to_s24_conversion,
+            sample_type=resampler_state.target_sample_type,
+        )
+
+    assert resampler_state.graph is not None  # guaranteed: not passthrough → graph was built
+
     # Create input frame
+    _validate_pcm_buffer_length(
+        av_input_pcm,
+        expected=sample_count * resampler_state.source_av_frame_stride,
+        context="resampler input",
+    )
     frame = av.AudioFrame(
         format=resampler_state.source_av_format,
         layout=resampler_state.source_av_layout,
         samples=sample_count,
     )
     frame.sample_rate = source_format.sample_rate
-    frame.planes[0].update(source_pcm)
+    frame.planes[0].update(av_input_pcm)
 
     # Resample
-    out_frames = resampler_state.resampler.resample(frame)
+    resampler_state.graph.push(frame)
+    out_frames = _drain_audio_graph(resampler_state.graph)
     out_pcm = bytearray()
     output_sample_count = 0
     for out_frame in out_frames:
@@ -235,6 +464,70 @@ def _resample_pcm_standalone(
         output_start_ts=output_start_ts,
         sample_count=output_sample_count,
         needs_s32_to_s24_conversion=resampler_state.needs_s32_to_s24_conversion,
+        sample_type=resampler_state.target_sample_type,
+    )
+
+
+def _quantize_float_pcm(
+    *,
+    channel_id: UUID,
+    pcm_data: bytes,
+    output_ts: int,
+    sample_rate: int,
+    channels: int,
+    target_bit_depth: int,
+    resampler_cache: dict[_ResamplerKey, _ResamplerState],
+) -> _ResampledPCM:
+    """Convert float32 PCM to integer output format using the provided cache."""
+    source_format = AudioFormat(
+        sample_rate=sample_rate,
+        bit_depth=32,
+        channels=channels,
+        sample_type="float",
+    )
+    target_format = AudioFormat(
+        sample_rate=sample_rate,
+        bit_depth=target_bit_depth,
+        channels=channels,
+        sample_type="int",
+    )
+    dither_method = _DITHER_METHOD_TRIANGULAR_HP if target_bit_depth == 16 else None
+
+    resampler_key = _ResamplerKey(
+        channel_id=channel_id,
+        source_format=source_format,
+        target_sample_rate=sample_rate,
+        target_channels=channels,
+        target_bit_depth=target_bit_depth,
+        target_sample_type="int",
+        dither_method=dither_method,
+    )
+    state = resampler_cache.get(resampler_key)
+    if state is None:
+        state = _create_resampler_state(resampler_key, source_format, target_format)
+        resampler_cache[resampler_key] = state
+    return _resample_pcm_standalone(state, pcm_data, source_format, output_ts)
+
+
+def _processing_format_for_roles(
+    source_format: AudioFormat,
+    *,
+    target_sample_rate: int,
+    target_bit_depth: int,
+    target_channels: int,
+) -> AudioFormat:
+    """Select processing format used during shared per-role resampling."""
+    if source_format.sample_type == "float":
+        return AudioFormat(
+            sample_rate=target_sample_rate,
+            bit_depth=32,
+            channels=target_channels,
+            sample_type="float",
+        )
+    return AudioFormat(
+        sample_rate=target_sample_rate,
+        bit_depth=target_bit_depth,
+        channels=target_channels,
     )
 
 
@@ -935,15 +1228,17 @@ class PushStream:
             return {}
 
         results: dict[tuple[UUID, int, int, int], _ResampledPCM] = {}
+        shared_results_by_resampler: dict[_ResamplerKey, _ResampledPCM] = {}
         for pcm_key in roles_by_pcm:
             channel_id, target_sample_rate, target_bit_depth, target_channels = pcm_key
             source_pcm, source_format = prepared[channel_id]
             input_timestamp_us = channel_play_start[channel_id]
 
-            target_format = AudioFormat(
-                sample_rate=target_sample_rate,
-                bit_depth=target_bit_depth,
-                channels=target_channels,
+            target_format = _processing_format_for_roles(
+                source_format,
+                target_sample_rate=target_sample_rate,
+                target_bit_depth=target_bit_depth,
+                target_channels=target_channels,
             )
 
             resampler_key = _ResamplerKey(
@@ -951,17 +1246,24 @@ class PushStream:
                 source_format=source_format,
                 target_sample_rate=target_sample_rate,
                 target_channels=target_channels,
-                target_bit_depth=target_bit_depth,
+                target_bit_depth=target_format.bit_depth,
+                target_sample_type=target_format.sample_type,
             )
+
+            if resampler_key in shared_results_by_resampler:
+                results[pcm_key] = shared_results_by_resampler[resampler_key]
+                continue
 
             state = self._get_cached_resampler(resampler_key)
             if state is None:
                 state = _create_resampler_state(resampler_key, source_format, target_format)
                 self._cache_resampler(state)
 
-            results[pcm_key] = _resample_pcm_standalone(
+            resampled = _resample_pcm_standalone(
                 state, source_pcm, source_format, input_timestamp_us
             )
+            shared_results_by_resampler[resampler_key] = resampled
+            results[pcm_key] = resampled
         return results
 
     def _resolve_frame_duration_us(self, req: AudioRequirements) -> int:
@@ -1070,6 +1372,26 @@ class PushStream:
             pcm_data = resampled.pcm_data
             output_ts = resampled.output_start_ts
             duration_us = int(resampled.sample_count * 1_000_000 / rate) if rate > 0 else 0
+            needs_s32_to_s24_conversion = resampled.needs_s32_to_s24_conversion
+
+            # Quantize float PCM once per pcm_key — all TransformKeys sharing this
+            # pcm_key produce the same quantizer _ResamplerKey. Using the quantizer's
+            # output_start_ts and sample_count ensures downstream timestamps reflect
+            # any buffering or trimming introduced by the quantizer graph.
+            if resampled.sample_type == "float":
+                edge_quantized = _quantize_float_pcm(
+                    channel_id=channel_id,
+                    pcm_data=pcm_data,
+                    output_ts=output_ts,
+                    sample_rate=rate,
+                    channels=_channels,
+                    target_bit_depth=depth,
+                    resampler_cache=self._resamplers,
+                )
+                pcm_data = edge_quantized.pcm_data
+                output_ts = edge_quantized.output_start_ts
+                duration_us = int(edge_quantized.sample_count * 1_000_000 / rate) if rate > 0 else 0
+                needs_s32_to_s24_conversion = edge_quantized.needs_s32_to_s24_conversion
 
             grouped_by_key: defaultdict[
                 TransformKey, list[tuple[SendspinClient, Role, AudioRequirements]]
@@ -1087,7 +1409,7 @@ class PushStream:
                 transformer = grouped[0][2].transformer
                 transformed_pcm = pcm_data
                 if (
-                    resampled.needs_s32_to_s24_conversion
+                    needs_s32_to_s24_conversion
                     and depth == 24
                     and isinstance(transformer, PcmPassthrough)
                 ):
@@ -1501,14 +1823,10 @@ class PushStream:
     ) -> list[CachedChunk]:
         """Resample PCM chunks to the target format and encode them sequentially."""
         tkey = self._build_transform_key(req, channel_id)
-        target_format = AudioFormat(
-            sample_rate=req.sample_rate,
-            bit_depth=req.bit_depth,
-            channels=req.channels,
-        )
         cached: list[CachedChunk] = []
         resampler_state: _ResamplerState | None = None
-        resampler_source_format: AudioFormat | None = None
+        resampler_cache_key: _ResamplerKey | None = None
+        quantizer_cache: dict[_ResamplerKey, _ResamplerState] = {}
 
         for chunk in pcm_chunks:
             source_format = AudioFormat(
@@ -1517,24 +1835,31 @@ class PushStream:
                 channels=chunk.channels,
                 sample_type=chunk.sample_type,
             )
+            target_format = _processing_format_for_roles(
+                source_format,
+                target_sample_rate=req.sample_rate,
+                target_bit_depth=req.bit_depth,
+                target_channels=req.channels,
+            )
+            current_resampler_key = _ResamplerKey(
+                channel_id=channel_id,
+                source_format=source_format,
+                target_sample_rate=req.sample_rate,
+                target_channels=req.channels,
+                target_bit_depth=target_format.bit_depth,
+                target_sample_type=target_format.sample_type,
+            )
             if (
                 resampler_state is None
-                or resampler_source_format is None
-                or resampler_source_format != source_format
+                or resampler_cache_key is None
+                or resampler_cache_key != current_resampler_key
             ):
-                resampler_key = _ResamplerKey(
-                    channel_id=channel_id,
-                    source_format=source_format,
-                    target_sample_rate=req.sample_rate,
-                    target_channels=req.channels,
-                    target_bit_depth=req.bit_depth,
-                )
                 resampler_state = _create_resampler_state(
-                    resampler_key,
+                    current_resampler_key,
                     source_format,
                     target_format,
                 )
-                resampler_source_format = source_format
+                resampler_cache_key = current_resampler_key
 
             resampled = _resample_pcm_standalone(
                 resampler_state,
@@ -1546,23 +1871,38 @@ class PushStream:
                 continue
 
             resampled_pcm = resampled.pcm_data
+            needs_s32_to_s24_conversion = resampled.needs_s32_to_s24_conversion
+            output_start_ts = resampled.output_start_ts
+            sample_count = resampled.sample_count
+
+            if resampled.sample_type == "float":
+                edge_quantized = _quantize_float_pcm(
+                    channel_id=channel_id,
+                    pcm_data=resampled_pcm,
+                    output_ts=resampled.output_start_ts,
+                    sample_rate=req.sample_rate,
+                    channels=req.channels,
+                    target_bit_depth=req.bit_depth,
+                    resampler_cache=quantizer_cache,
+                )
+                resampled_pcm = edge_quantized.pcm_data
+                needs_s32_to_s24_conversion = edge_quantized.needs_s32_to_s24_conversion
+                output_start_ts = edge_quantized.output_start_ts
+                sample_count = edge_quantized.sample_count
+
             if (
-                resampled.needs_s32_to_s24_conversion
+                needs_s32_to_s24_conversion
                 and req.bit_depth == 24
                 and isinstance(encoder, PcmPassthrough)
             ):
                 resampled_pcm = _convert_s32_to_s24(resampled_pcm)
-            duration_us = (
-                int(resampled.sample_count * 1_000_000 / req.sample_rate)
-                if resampled.sample_count > 0
-                else 0
-            )
+            duration_us = int(sample_count * 1_000_000 / req.sample_rate) if sample_count > 0 else 0
 
             encoded_frames = self._encode_transform_for_key(
                 tkey,
                 encoder,
                 resampled_pcm,
-                resampled.output_start_ts,
+                output_start_ts,
                 duration_us,
             )
             for data, ts, dur in encoded_frames:

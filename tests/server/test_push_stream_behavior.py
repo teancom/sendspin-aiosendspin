@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,7 @@ from aiosendspin.models.player import (
     SupportedAudioFormat,
 )
 from aiosendspin.models.types import AudioCodec, PlayerCommand, Roles
+from aiosendspin.server import push_stream as push_stream_module
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.audio_transformers import TransformerPool
 from aiosendspin.server.channels import MAIN_CHANNEL
@@ -36,7 +38,7 @@ from aiosendspin.server.push_stream import (
     PushStream,
 )
 from aiosendspin.server.roles import AudioChunk, AudioRequirements
-from aiosendspin.server.roles.player.audio_transformers import PcmPassthrough
+from aiosendspin.server.roles.player.audio_transformers import FlacEncoder, PcmPassthrough
 
 
 @dataclass(slots=True)
@@ -144,6 +146,18 @@ class _DummyClient:
         self.is_connected = True
         self.active_roles = roles
         self.connection = _FakeConnection()
+
+
+def _expand_packed_s24_to_s32(data: bytes) -> bytes:
+    """Expand packed s24 PCM to PyAV's left-aligned s32 representation."""
+    if sys.byteorder == "little":
+        return b"".join(b"\x00" + data[i : i + 3] for i in range(0, len(data), 3))
+    return b"".join(data[i : i + 3] + b"\x00" for i in range(0, len(data), 3))
+
+
+def _packed_s24_pcm_25ms() -> bytes:
+    """Build one 25ms stereo PCM chunk with a stable packed-s24 byte pattern."""
+    return bytes([0x11, 0x21, 0x31, 0x12, 0x22, 0x32]) * 1200
 
 
 def _make_connected_player(
@@ -272,6 +286,142 @@ async def test_commit_audio_sends_stream_start_and_binary(mock_loop: Any) -> Non
     buffer_tracker = role.get_buffer_tracker()
     assert buffer_tracker is not None
     assert buffer_tracker.buffered_bytes > 0
+
+
+@pytest.mark.asyncio
+async def test_commit_audio_float_input_quantizes_at_output_edge(
+    mock_loop: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Float input should be quantized at the output edge for integer player requirements."""
+    group = _DummyGroup(clients=[])
+    _client, conn = _make_connected_player(mock_loop, group, "p1")
+
+    quantize_calls = 0
+    original_quantizer = push_stream_module._quantize_float_pcm  # noqa: SLF001
+
+    def _counted_quantizer(**kwargs: Any) -> object:
+        nonlocal quantize_calls
+        quantize_calls += 1
+        return original_quantizer(**kwargs)
+
+    monkeypatch.setattr(push_stream_module, "_quantize_float_pcm", _counted_quantizer)
+
+    stream = PushStream(loop=mock_loop, clock=LoopClock(mock_loop), group=group)
+    stream.prepare_audio(
+        bytes(9600),  # 25ms @ 48kHz stereo f32
+        AudioFormat(sample_rate=48_000, bit_depth=32, channels=2, sample_type="float"),
+    )
+    await stream.commit_audio()
+
+    assert quantize_calls > 0
+    assert conn.sent_binary
+
+
+def test_quantize_float_to_s16_uses_triangular_hp_dither(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Float to s16 quantization should request triangular_hp dithering."""
+    captured_dither_methods: list[str | None] = []
+    original_build_resample_graph = push_stream_module._build_resample_graph  # noqa: SLF001
+
+    def _record_build_resample_graph(
+        *,
+        source_av_format: str,
+        source_layout: str,
+        source_sample_rate: int,
+        target_av_format: str,
+        target_layout: str,
+        target_sample_rate: int,
+        dither_method: str | None = None,
+    ) -> object:
+        if source_av_format == "flt" and target_av_format == "s16":
+            captured_dither_methods.append(dither_method)
+        return original_build_resample_graph(
+            source_av_format=source_av_format,
+            source_layout=source_layout,
+            source_sample_rate=source_sample_rate,
+            target_av_format=target_av_format,
+            target_layout=target_layout,
+            target_sample_rate=target_sample_rate,
+            dither_method=dither_method,
+        )
+
+    monkeypatch.setattr(push_stream_module, "_build_resample_graph", _record_build_resample_graph)
+
+    group = _DummyGroup(clients=[])
+    stream = PushStream(loop=MagicMock(), clock=ManualClock(), group=group)
+    push_stream_module._quantize_float_pcm(  # noqa: SLF001
+        channel_id=MAIN_CHANNEL,
+        pcm_data=bytes(9600),  # 25ms @ 48kHz stereo f32
+        output_ts=0,
+        sample_rate=48_000,
+        channels=2,
+        target_bit_depth=16,
+        resampler_cache=stream._resamplers,  # noqa: SLF001
+    )
+
+    assert captured_dither_methods
+    assert captured_dither_methods[-1] == "triangular_hp"
+
+
+def test_quantize_float_to_s16_preserves_dither_on_resampler_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drift-triggered graph rebuild must preserve triangular_hp dithering."""
+    captured_dither_methods: list[str | None] = []
+    original_build_resample_graph = push_stream_module._build_resample_graph  # noqa: SLF001
+
+    def _record_build_resample_graph(
+        *,
+        source_av_format: str,
+        source_layout: str,
+        source_sample_rate: int,
+        target_av_format: str,
+        target_layout: str,
+        target_sample_rate: int,
+        dither_method: str | None = None,
+    ) -> object:
+        if source_av_format == "flt" and target_av_format == "s16":
+            captured_dither_methods.append(dither_method)
+        return original_build_resample_graph(
+            source_av_format=source_av_format,
+            source_layout=source_layout,
+            source_sample_rate=source_sample_rate,
+            target_av_format=target_av_format,
+            target_layout=target_layout,
+            target_sample_rate=target_sample_rate,
+            dither_method=dither_method,
+        )
+
+    monkeypatch.setattr(push_stream_module, "_build_resample_graph", _record_build_resample_graph)
+
+    group = _DummyGroup(clients=[])
+    stream = PushStream(loop=MagicMock(), clock=ManualClock(), group=group)
+    # First call creates the quantizer graph. Second call with stale timestamp creates >20ms
+    # drift, forcing graph rebuild in _resample_pcm_standalone.
+    push_stream_module._quantize_float_pcm(  # noqa: SLF001
+        channel_id=MAIN_CHANNEL,
+        pcm_data=bytes(9600),  # 25ms @ 48kHz stereo f32
+        output_ts=0,
+        sample_rate=48_000,
+        channels=2,
+        target_bit_depth=16,
+        resampler_cache=stream._resamplers,  # noqa: SLF001
+    )
+    push_stream_module._quantize_float_pcm(  # noqa: SLF001
+        channel_id=MAIN_CHANNEL,
+        pcm_data=bytes(9600),  # 25ms @ 48kHz stereo f32
+        output_ts=0,
+        sample_rate=48_000,
+        channels=2,
+        target_bit_depth=16,
+        resampler_cache=stream._resamplers,  # noqa: SLF001
+    )
+
+    assert len(captured_dither_methods) >= 2
+    assert captured_dither_methods[0] == "triangular_hp"
+    assert captured_dither_methods[-1] == "triangular_hp"
 
 
 @pytest.mark.asyncio
@@ -1899,6 +2049,474 @@ async def test_late_joiner_after_historical_injection() -> None:
 
     assert role2.started == 1
     assert role2.received
+
+
+def test_drift_rebuild_flushes_old_graph_before_replacing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drift-triggered graph rebuild must flush the old graph before replacing it."""
+    flush_calls: list[bool] = []
+    original_build = push_stream_module._build_resample_graph  # noqa: SLF001
+
+    class _SpyGraph:
+        """Wraps a real graph to detect push(None) flush calls."""
+
+        def __init__(self, real_graph: object) -> None:
+            self._real = real_graph
+
+        def push(self, frame: object) -> None:
+            if frame is None:
+                flush_calls.append(True)
+            self._real.push(frame)  # type: ignore[union-attr]
+
+        def pull(self) -> object:
+            return self._real.pull()  # type: ignore[union-attr]
+
+    def _spy_build(**kwargs: Any) -> object:
+        graph = original_build(**kwargs)
+        return _SpyGraph(graph)
+
+    monkeypatch.setattr(push_stream_module, "_build_resample_graph", _spy_build)
+
+    group = _DummyGroup(clients=[])
+    stream = PushStream(loop=MagicMock(), clock=ManualClock(), group=group)
+    pcm_25ms = bytes(9600)  # 25ms @ 48kHz stereo f32
+
+    # First call: creates graph, advances pending_timestamp_us by ~25ms
+    push_stream_module._quantize_float_pcm(  # noqa: SLF001
+        channel_id=MAIN_CHANNEL,
+        pcm_data=pcm_25ms,
+        output_ts=0,
+        sample_rate=48_000,
+        channels=2,
+        target_bit_depth=16,
+        resampler_cache=stream._resamplers,  # noqa: SLF001
+    )
+    # Second call with same output_ts=0: drift > 20ms, triggers rebuild
+    push_stream_module._quantize_float_pcm(  # noqa: SLF001
+        channel_id=MAIN_CHANNEL,
+        pcm_data=pcm_25ms,
+        output_ts=0,
+        sample_rate=48_000,
+        channels=2,
+        target_bit_depth=16,
+        resampler_cache=stream._resamplers,  # noqa: SLF001
+    )
+
+    assert flush_calls, "Old graph should have been flushed with push(None) before rebuild"
+
+
+@pytest.mark.asyncio
+async def test_multi_role_fanout_quantizes_once_per_pcm_key(
+    mock_loop: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple TransformKeys sharing a pcm_key must quantize float PCM only once."""
+    group = _DummyGroup(clients=[])
+    pool = group.transformer_pool
+
+    # Two roles with different frame durations → different TransformKeys, same pcm_key
+    role1 = _DummyRole(
+        AudioRequirements(
+            sample_rate=48_000,
+            bit_depth=16,
+            channels=2,
+            transformer=pool.get_or_create(
+                PcmPassthrough,
+                channel_id=MAIN_CHANNEL.int,
+                sample_rate=48_000,
+                bit_depth=16,
+                channels=2,
+                frame_duration_us=25_000,
+            ),
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=25_000,
+        )
+    )
+    role2 = _DummyRole(
+        AudioRequirements(
+            sample_rate=48_000,
+            bit_depth=16,
+            channels=2,
+            transformer=pool.get_or_create(
+                PcmPassthrough,
+                channel_id=MAIN_CHANNEL.int,
+                sample_rate=48_000,
+                bit_depth=16,
+                channels=2,
+                frame_duration_us=50_000,
+            ),
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=50_000,
+        )
+    )
+    group.clients.extend([_DummyClient([role1]), _DummyClient([role2])])
+
+    quantize_calls = 0
+    original_quantizer = push_stream_module._quantize_float_pcm  # noqa: SLF001
+
+    def _counted_quantizer(**kwargs: Any) -> object:
+        nonlocal quantize_calls
+        quantize_calls += 1
+        return original_quantizer(**kwargs)
+
+    monkeypatch.setattr(push_stream_module, "_quantize_float_pcm", _counted_quantizer)
+
+    stream = PushStream(loop=mock_loop, clock=LoopClock(mock_loop), group=group)
+    stream.prepare_audio(
+        bytes(9600),  # 25ms @ 48kHz stereo f32
+        AudioFormat(sample_rate=48_000, bit_depth=32, channels=2, sample_type="float"),
+    )
+    await stream.commit_audio()
+
+    assert quantize_calls == 1, f"Expected 1 quantize call per pcm_key, got {quantize_calls}"
+    assert role1.received, "role1 should have received audio chunks"
+    # role2 may not receive chunks yet because 25ms of data is below its
+    # 50ms frame duration — the important assertion is quantize_calls == 1.
+
+
+@pytest.mark.asyncio
+async def test_catchup_quantizer_does_not_share_live_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch-up path must use its own quantizer state, not the shared live cache."""
+    drift_rebuild_count = 0
+    original_resample = push_stream_module._resample_pcm_standalone  # noqa: SLF001
+
+    def _tracking_resample(state: Any, pcm: bytes, fmt: Any, ts: int) -> Any:
+        nonlocal drift_rebuild_count
+        if state.pending_timestamp_us is not None:
+            drift_us = abs(state.pending_timestamp_us - ts)
+            if drift_us > 20_000:
+                drift_rebuild_count += 1
+        return original_resample(state, pcm, fmt, ts)
+
+    monkeypatch.setattr(push_stream_module, "_resample_pcm_standalone", _tracking_resample)
+
+    class TransformerA:
+        pending_timestamp_us: int | None = None
+
+        @property
+        def frame_duration_us(self) -> int:
+            return 25_000
+
+        def process(self, pcm: bytes, _ts: int, _dur: int) -> list[bytes]:
+            return [pcm]
+
+        def flush(self) -> list[bytes]:
+            return []
+
+        def get_header(self) -> bytes | None:
+            return None
+
+        def reset(self) -> None:
+            return
+
+    class TransformerB(TransformerA):
+        pass
+
+    group = _DummyGroup(clients=[])
+
+    # role1 uses TransformerA — its live encoding builds quantizer state in self._resamplers
+    role1 = _DummyRole(
+        AudioRequirements(
+            sample_rate=48_000,
+            bit_depth=16,
+            channels=2,
+            transformer=TransformerA(),
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=25_000,
+        )
+    )
+    group.clients.append(_DummyClient([role1]))
+
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=0)
+    stream = PushStream(loop=loop, clock=clock, group=group)
+    stream.enable_pcm_cache_for_channel(MAIN_CHANNEL)
+
+    # Commit several float PCM chunks — builds live quantizer state.
+    # Advance clock by 25ms (matching audio duration) between commits to
+    # keep resampler timestamps monotonic without drift-triggered rebuilds.
+    for _ in range(4):
+        stream.prepare_audio(
+            bytes(9600),  # 25ms @ 48kHz stereo f32
+            AudioFormat(sample_rate=48_000, bit_depth=32, channels=2, sample_type="float"),
+        )
+        await stream.commit_audio()
+        clock.advance_us(25_000)
+
+    # Count drift rebuilds so far (live path — should be 0 with ManualClock)
+    live_drifts = drift_rebuild_count
+
+    # Add a late-joining role with TransformerB — different TransformKey, triggers PCM catch-up
+    role2 = _DummyRole(
+        AudioRequirements(
+            sample_rate=48_000,
+            bit_depth=16,
+            channels=2,
+            transformer=TransformerB(),
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=25_000,
+        )
+    )
+    group.clients.append(_DummyClient([role2]))
+    stream.on_role_join(role2)
+
+    # Wait for the async catch-up task to complete
+    for _ in range(50):
+        if role2.received:
+            break
+        await asyncio.sleep(0.01)
+
+    # Catch-up should NOT trigger drift-rebuilds in the shared quantizer cache.
+    # With separate cache: fresh quantizer state, no drift detection.
+    # With shared cache: the jump from live timestamps (~350ms) to historical
+    # timestamps (~250ms) causes drift > 20ms, triggering a graph rebuild.
+    catchup_drifts = drift_rebuild_count - live_drifts
+    assert catchup_drifts == 0, (
+        f"Expected 0 drift-triggered rebuilds during catch-up, got {catchup_drifts} "
+        f"(likely shared quantizer cache causing timestamp jump)"
+    )
+
+
+def test_noop_resample_bypasses_graph_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resampling with identical source/target should skip graph construction."""
+    build_calls = 0
+    original_build = push_stream_module._build_resample_graph  # noqa: SLF001
+
+    def _counting_build(**kwargs: Any) -> object:
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(**kwargs)
+
+    monkeypatch.setattr(push_stream_module, "_build_resample_graph", _counting_build)
+
+    source = AudioFormat(sample_rate=48_000, bit_depth=16, channels=2, sample_type="int")
+    key = push_stream_module._ResamplerKey(  # noqa: SLF001
+        channel_id=MAIN_CHANNEL,
+        source_format=source,
+        target_sample_rate=48_000,
+        target_channels=2,
+        target_bit_depth=16,
+        target_sample_type="int",
+    )
+    state = push_stream_module._create_resampler_state(key, source, source)  # noqa: SLF001
+
+    pcm_25ms = bytes(4800)  # 25ms @ 48kHz stereo s16
+    result = push_stream_module._resample_pcm_standalone(  # noqa: SLF001
+        state, pcm_25ms, source, 1_000_000
+    )
+
+    assert build_calls == 0, "No-op resample should not build a filter graph"
+    assert result.pcm_data == pcm_25ms, "No-op resample should return input PCM unchanged"
+    assert result.sample_count == 1200  # 48000 * 0.025
+    assert result.output_start_ts == 1_000_000
+
+
+def test_24bit_passthrough_expands_to_s32_and_marks_wire_conversion() -> None:
+    """Packed s24 passthrough should still normalize to s32 for internal processing."""
+    source = AudioFormat(sample_rate=48_000, bit_depth=24, channels=2, sample_type="int")
+    key = push_stream_module._ResamplerKey(  # noqa: SLF001
+        channel_id=MAIN_CHANNEL,
+        source_format=source,
+        target_sample_rate=48_000,
+        target_channels=2,
+        target_bit_depth=24,
+        target_sample_type="int",
+    )
+    state = push_stream_module._create_resampler_state(key, source, source)  # noqa: SLF001
+
+    packed_pcm = bytes([0x11, 0x21, 0x31, 0x12, 0x22, 0x32]) * 2
+    result = push_stream_module._resample_pcm_standalone(  # noqa: SLF001
+        state, packed_pcm, source, 1_000_000
+    )
+
+    assert state.is_passthrough
+    assert result.pcm_data == _expand_packed_s24_to_s32(packed_pcm)
+    assert result.sample_count == 2
+    assert result.needs_s32_to_s24_conversion is True
+
+
+def test_24bit_input_expands_to_s32_before_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Packed s24 input must be expanded before writing into an s32 PyAV frame."""
+    captured_input: bytes | None = None
+
+    class _CapturingGraph:
+        def push(self, frame: Any | None) -> None:
+            nonlocal captured_input
+            assert frame is not None
+            captured_input = bytes(frame.planes[0])
+
+        def pull(self) -> Any:
+            raise EOFError
+
+    def _build_capturing_graph(**_kwargs: Any) -> _CapturingGraph:
+        return _CapturingGraph()
+
+    monkeypatch.setattr(push_stream_module, "_build_resample_graph", _build_capturing_graph)
+
+    source = AudioFormat(sample_rate=48_000, bit_depth=24, channels=2, sample_type="int")
+    target = AudioFormat(sample_rate=48_000, bit_depth=32, channels=2, sample_type="int")
+    key = push_stream_module._ResamplerKey(  # noqa: SLF001
+        channel_id=MAIN_CHANNEL,
+        source_format=source,
+        target_sample_rate=48_000,
+        target_channels=2,
+        target_bit_depth=32,
+        target_sample_type="int",
+    )
+    state = push_stream_module._create_resampler_state(key, source, target)  # noqa: SLF001
+
+    packed_pcm = bytes([0x11, 0x21, 0x31, 0x12, 0x22, 0x32]) * 2
+    push_stream_module._resample_pcm_standalone(  # noqa: SLF001
+        state, packed_pcm, source, 1_000_000
+    )
+
+    assert captured_input == _expand_packed_s24_to_s32(packed_pcm)
+
+
+def test_encode_pcm_sequence_preserves_packed_s24_for_pcm_passthrough() -> None:
+    """Raw PCM output should convert internal s32 back to packed s24 on the wire."""
+    group = _DummyGroup(clients=[])
+    stream = PushStream(loop=MagicMock(), clock=ManualClock(), group=group)
+    encoder = PcmPassthrough(sample_rate=48_000, bit_depth=24, channels=2)
+    req = AudioRequirements(
+        sample_rate=48_000,
+        bit_depth=24,
+        channels=2,
+        transformer=encoder,
+        channel_id=MAIN_CHANNEL,
+        frame_duration_us=25_000,
+    )
+    packed_pcm = _packed_s24_pcm_25ms()
+    pcm_chunk = CachedPCMChunk(
+        timestamp_us=1_000_000,
+        duration_us=25_000,
+        pcm_data=packed_pcm,
+        sample_rate=48_000,
+        bit_depth=24,
+        channels=2,
+    )
+
+    encoded = stream._encode_pcm_sequence([pcm_chunk], encoder, req, MAIN_CHANNEL)  # noqa: SLF001
+
+    assert len(encoded) == 1
+    assert encoded[0].payload == packed_pcm
+
+
+def test_encode_pcm_sequence_expands_s24_before_flac_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FLAC encoding should receive AV-format s32 bytes for 24-bit PCM."""
+    group = _DummyGroup(clients=[])
+    stream = PushStream(loop=MagicMock(), clock=ManualClock(), group=group)
+    encoder = FlacEncoder(sample_rate=48_000, bit_depth=24, channels=2)
+    captured_chunk: bytes | None = None
+
+    def _fake_ensure_initialized() -> None:
+        encoder._initialized = True  # noqa: SLF001
+        encoder._chunk_samples = 1200  # noqa: SLF001
+        encoder._chunk_duration_us = 25_000  # noqa: SLF001
+        encoder._frame_stride = 8  # noqa: SLF001
+        encoder._av_format = "s32"  # noqa: SLF001
+        encoder._av_layout = "stereo"  # noqa: SLF001
+
+    def _capture_chunk(chunk_pcm: bytes) -> bytes:
+        nonlocal captured_chunk
+        captured_chunk = chunk_pcm
+        return b"flac"
+
+    monkeypatch.setattr(encoder, "_ensure_initialized", _fake_ensure_initialized)
+    monkeypatch.setattr(encoder, "_encode_chunk", _capture_chunk)
+
+    req = AudioRequirements(
+        sample_rate=48_000,
+        bit_depth=24,
+        channels=2,
+        transformer=encoder,
+        channel_id=MAIN_CHANNEL,
+        frame_duration_us=25_000,
+    )
+    packed_pcm = _packed_s24_pcm_25ms()
+    pcm_chunk = CachedPCMChunk(
+        timestamp_us=1_000_000,
+        duration_us=25_000,
+        pcm_data=packed_pcm,
+        sample_rate=48_000,
+        bit_depth=24,
+        channels=2,
+    )
+
+    encoded = stream._encode_pcm_sequence([pcm_chunk], encoder, req, MAIN_CHANNEL)  # noqa: SLF001
+
+    assert len(encoded) == 1
+    assert encoded[0].payload == b"flac"
+    assert captured_chunk == _expand_packed_s24_to_s32(packed_pcm)
+
+
+def test_soxr_fallback_caches_failure_per_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After soxr fails for a format combo, subsequent calls skip straight to swr."""
+    # Force _supports_soxr_resampler to return True
+    monkeypatch.setattr(push_stream_module, "_supports_soxr_resampler", lambda: True)
+
+    # Replace with a fresh set so test mutations don't leak; monkeypatch restores on teardown
+    monkeypatch.setattr(push_stream_module, "_soxr_failed_configs", set())
+
+    av_mod = push_stream_module._get_av()  # noqa: SLF001
+    OriginalGraph = av_mod.filter.Graph  # noqa: N806
+    soxr_attempt_count = 0
+
+    class _TrackingSoxrGraph:
+        """Graph wrapper that fails on soxr and tracks attempts."""
+
+        def __init__(self) -> None:
+            self._real = OriginalGraph()
+
+        def add_abuffer(self, **kwargs: Any) -> Any:
+            return self._real.add_abuffer(**kwargs)
+
+        def add(self, name: str, args: str = "") -> Any:
+            nonlocal soxr_attempt_count
+            if "soxr" in args:
+                soxr_attempt_count += 1
+                raise OSError("simulated soxr failure")
+            return self._real.add(name, args)
+
+        def link_nodes(self, *nodes: Any) -> Any:
+            return self._real.link_nodes(*nodes)
+
+    monkeypatch.setattr(av_mod.filter, "Graph", _TrackingSoxrGraph)
+
+    # First call: soxr fails, falls back to swr
+    push_stream_module._build_resample_graph(  # noqa: SLF001
+        source_av_format="s16",
+        source_layout="stereo",
+        source_sample_rate=44_100,
+        target_av_format="s16",
+        target_layout="stereo",
+        target_sample_rate=48_000,
+    )
+    first_soxr_attempts = soxr_attempt_count
+
+    # Second call with same format: should skip soxr entirely
+    push_stream_module._build_resample_graph(  # noqa: SLF001
+        source_av_format="s16",
+        source_layout="stereo",
+        source_sample_rate=44_100,
+        target_av_format="s16",
+        target_layout="stereo",
+        target_sample_rate=48_000,
+    )
+
+    assert first_soxr_attempts == 1, "First call should attempt soxr once"
+    assert soxr_attempt_count == 1, (
+        f"Second call should skip soxr (cached failure), but got {soxr_attempt_count} attempts"
+    )
 
 
 # ---------------------------------------------------------------------------
