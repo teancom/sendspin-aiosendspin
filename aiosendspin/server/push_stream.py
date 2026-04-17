@@ -216,6 +216,22 @@ def _encode_for_transform_key(
         if abs(candidate_base - output_ts) <= _TRANSFORMER_DRIFT_THRESHOLD_US:
             base_ts = candidate_base
 
+    # DIAG: log whenever the chosen base_ts is BEFORE output_ts so we can see
+    # the exact pending-vs-output_ts arithmetic that produces backward-stamped
+    # output frames. Silent in the happy case (base_ts >= output_ts).
+    if _LOGGER.isEnabledFor(logging.DEBUG) and base_ts < output_ts:
+        _LOGGER.debug(
+            "encode_base_backward base_ts=%d output_ts=%d delta_us=%d pending=%s "
+            "frames=%d frame_dur=%d transformer=%s",
+            base_ts,
+            output_ts,
+            base_ts - output_ts,
+            pending,
+            len(frames),
+            frame_dur,
+            type(transformer).__name__,
+        )
+
     return [(data, base_ts + i * frame_dur, frame_dur) for i, data in enumerate(frames)]
 
 
