@@ -384,6 +384,21 @@ def _resample_pcm_standalone(
                     target_sample_rate=resampler_state.key.target_sample_rate,
                     dither_method=resampler_state.key.dither_method,
                 )
+            # DIAG: resampler timestamp resync. Each reset captures a fresh
+            # anchor from the input stream which can change the mod-1000
+            # residue of subsequent chunk timestamps emerging from this
+            # resampler — a candidate source of the drifting dual-stream
+            # suffix we're hunting.
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(
+                    "resampler_drift_reset old_pending_us=%d input_ts_us=%d drift_us=%d "
+                    "sr_in=%d sr_out=%d",
+                    resampler_state.pending_timestamp_us,
+                    input_timestamp_us,
+                    resampler_state.pending_timestamp_us - input_timestamp_us,
+                    resampler_state.source_sample_rate,
+                    resampler_state.key.target_sample_rate,
+                )
             resampler_state.pending_timestamp_us = input_timestamp_us
 
     # Calculate sample count from input
@@ -1026,6 +1041,21 @@ class PushStream:
         min_timing_us = min(rebase_candidates)
         if min_timing_us < target_min_us:
             shift_us = target_min_us - min_timing_us
+            # DIAG: rebase shifts change the mod-1000 residue of all subsequent
+            # chunk timestamps. When two paths emit chunks with residues that
+            # differ by the shift_us amount, they look like two concurrent
+            # streams to the client.
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(
+                    "timeline_rebase shift_us=%d min_timing_us=%d target_min_us=%d "
+                    "now_us=%d channels=%d prepared=%d",
+                    shift_us,
+                    min_timing_us,
+                    target_min_us,
+                    now_us,
+                    len(self._channel_timing),
+                    len(prepared),
+                )
             for channel_id in self._channel_timing:
                 self._channel_timing[channel_id] += shift_us
 
@@ -1054,6 +1084,19 @@ class PushStream:
         min_delivery_timestamp_us = (
             now_us + DEFAULT_INITIAL_DELAY_US + self._max_active_static_delay_us()
         )
+        # DIAG: historical-buffer injection is one of the expected code paths
+        # that can emit chunks with backward timestamps (for late-joiners). Log
+        # entry so we can correlate dual-stream episodes to this path firing.
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "historical_buffers_enter channels=%d now_us=%d explicit_starts=%s "
+                "chunk_counts=%s channel_timing=%s",
+                len(historical),
+                now_us,
+                {str(cid): ts for cid, ts in (historical_start_us or {}).items()},
+                {str(cid): len(chs) for cid, chs in historical.items()},
+                {str(cid): ts for cid, ts in self._channel_timing.items()},
+            )
 
         for channel_id, chunks in historical.items():
             if not self._is_generation_active(commit_generation):

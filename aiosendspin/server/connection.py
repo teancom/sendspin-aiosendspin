@@ -265,7 +265,28 @@ class SendspinConnection:
         # Keep per-role queue ordering monotonic so role-scoped lifecycle JSON
         # (stream/start, stream/end, stream/clear) cannot be overtaken by binary
         # packets that carry an older playback timestamp (e.g. historical backfill).
-        sort_ts = max(0, timestamp_us, self._last_enqueued_ts_by_role.get(role, 0))
+        prev_enqueued_ts = self._last_enqueued_ts_by_role.get(role, 0)
+        sort_ts = max(0, timestamp_us, prev_enqueued_ts)
+        # DIAG: flag backward-in-time enqueues. These occur for historical
+        # backfill (expected, bounded) and for the post-transition dual-stream
+        # glitch we're hunting (unexpected, sustained). `delta_us` is negative
+        # when the enqueued ts is earlier than the previous ts for this role.
+        if (
+            self._logger.isEnabledFor(logging.DEBUG)
+            and prev_enqueued_ts > 0
+            and timestamp_us < prev_enqueued_ts
+        ):
+            self._logger.debug(
+                "enqueue_backward_ts role=%s ts_us=%d prev_ts_us=%d delta_us=%d "
+                "now_us=%d message_type=%d duration_us=%s",
+                role,
+                timestamp_us,
+                prev_enqueued_ts,
+                timestamp_us - prev_enqueued_ts,
+                self._server.clock.now_us(),
+                message_type,
+                duration_us,
+            )
         entry = _RoleQueueEntry(
             epoch=self._epoch_by_role[role],
             timestamp_us=timestamp_us,
