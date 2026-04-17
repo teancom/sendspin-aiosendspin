@@ -223,6 +223,14 @@ class SendspinConnection:
         roles_to_drop = list(self._epoch_by_role.keys()) if roles is None else roles
         for role in roles_to_drop:
             self._epoch_by_role[role] += 1
+            # DIAG: track transitions & stream clears advance the epoch.
+            # Paired with `chunk_push epoch=N`, this marks where a track
+            # boundary happens in the wall-clock timeline of the server log.
+            self._logger.debug(
+                "epoch_advance role=%s new_epoch=%d",
+                role,
+                self._epoch_by_role[role],
+            )
         self._writer_wakeup.set()
 
     def send_binary(
@@ -1045,6 +1053,34 @@ class SendspinConnection:
             ts_gap_ms = (timestamp_us - last_ts_us) / 1000 if last_ts_us is not None else 0
             self._last_send_time_us_by_role[role] = now_us
             self._last_timestamp_us_by_role[role] = timestamp_us
+
+            # DIAG: per-chunk push tracing. Logs timestamp, declared content
+            # duration, and size of every player binary emission so we can
+            # distinguish (a) variable-sized chunks with matching timestamps
+            # from (b) uniform chunks with mis-scaled timestamps. A persistent
+            # `mismatch_us` above ~100us means the server is telling clients
+            # chunk N+1 starts at a time that doesn't match how much audio
+            # chunk N actually contained — which causes audible overlap/gap.
+            if role == "player" and entry.binary is not None:
+                bin_data = entry.binary
+                declared_dur_us = bin_data.duration_us or 0
+                payload_bytes = len(bin_data.data)
+                ts_gap_us = int(ts_gap_ms * 1000)
+                if last_ts_us is not None and declared_dur_us:
+                    mismatch_us = abs(declared_dur_us - ts_gap_us)
+                else:
+                    mismatch_us = -1
+                self._logger.debug(
+                    "chunk_push epoch=%d ts_us=%d dur_us=%d bytes=%d "
+                    "ts_gap_us=%d send_gap_us=%d mismatch_us=%d",
+                    entry.epoch,
+                    timestamp_us,
+                    declared_dur_us,
+                    payload_bytes,
+                    ts_gap_us,
+                    int(send_gap_ms * 1000),
+                    mismatch_us,
+                )
 
         self._discard_role_head(role)
         await self._send_binary_data(wsock, role, entry, buffer_tracker)
