@@ -34,6 +34,7 @@ import asyncio
 import heapq
 import logging
 import time
+import traceback
 from collections import defaultdict, deque
 from contextlib import suppress
 from dataclasses import dataclass
@@ -271,14 +272,18 @@ class SendspinConnection:
         # backfill (expected, bounded) and for the post-transition dual-stream
         # glitch we're hunting (unexpected, sustained). `delta_us` is negative
         # when the enqueued ts is earlier than the previous ts for this role.
+        # Include a compressed call stack (top 5 frames) so we can identify
+        # the producing code path directly from one log line.
         if (
             self._logger.isEnabledFor(logging.DEBUG)
             and prev_enqueued_ts > 0
             and timestamp_us < prev_enqueued_ts
         ):
+            stack = traceback.extract_stack(limit=10)[:-1]
+            stack_compact = " <- ".join(f"{frame.name}:{frame.lineno}" for frame in stack[-5:])
             self._logger.debug(
                 "enqueue_backward_ts role=%s ts_us=%d prev_ts_us=%d delta_us=%d "
-                "now_us=%d message_type=%d duration_us=%s",
+                "now_us=%d message_type=%d duration_us=%s stack=%s",
                 role,
                 timestamp_us,
                 prev_enqueued_ts,
@@ -286,6 +291,7 @@ class SendspinConnection:
                 self._server.clock.now_us(),
                 message_type,
                 duration_us,
+                stack_compact,
             )
         entry = _RoleQueueEntry(
             epoch=self._epoch_by_role[role],
