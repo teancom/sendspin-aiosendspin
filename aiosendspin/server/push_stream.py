@@ -355,7 +355,7 @@ def _create_resampler_state(
     )
 
 
-def _resample_pcm_standalone(
+def _resample_pcm_standalone(  # noqa: PLR0915 (diagnostic logging; revert with debug/logging patches)
     resampler_state: _ResamplerState,
     source_pcm: bytes,
     source_format: AudioFormat,
@@ -376,6 +376,13 @@ def _resample_pcm_standalone(
     """
     av = _get_av()
 
+    # DIAG: capture entry state for per-call tracing (investigating backward
+    # output_start_ts during audio glitches). Emitted once per call via
+    # `resample_call` log at each return path below. Remove with the rest
+    # of the debug/logging patches once the origin is nailed down.
+    initial_pending_us = resampler_state.pending_timestamp_us
+    reset_fired = False
+
     # Handle timestamp tracking
     if resampler_state.pending_timestamp_us is None:
         resampler_state.pending_timestamp_us = input_timestamp_us
@@ -383,6 +390,7 @@ def _resample_pcm_standalone(
         # Resync if timestamp drifts too far (e.g., resampler was idle)
         drift_us = abs(resampler_state.pending_timestamp_us - input_timestamp_us)
         if drift_us > 20_000:
+            reset_fired = True
             # Flush the old graph to release FIR filter tails cleanly.
             # Flushed samples are discarded — they belong to the stale timeline.
             if resampler_state.graph is not None:
@@ -417,6 +425,41 @@ def _resample_pcm_standalone(
                 )
             resampler_state.pending_timestamp_us = input_timestamp_us
 
+    def _emit_resample_call_trace(
+        output_start_ts: int,
+        output_samples: int,
+        duration_us: int,
+    ) -> None:
+        """DIAG: emit per-call resampler state trace.
+
+        Captures pending-before/after, input ts, whether drift-reset fired,
+        plus the state-instance id so we can tell if two resamplers are
+        interleaving output for the same role (multi-channel interference
+        hypothesis from handoff v3).
+        """
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        _LOGGER.debug(
+            "resample_call state_id=0x%x channel_id=%s sr_in=%d sr_out=%d "
+            "bd=%d pt=%s passthrough=%s input_ts_us=%d initial_pending_us=%s "
+            "reset=%s output_start_ts=%d output_samples=%d duration_us=%d "
+            "pending_after_us=%d",
+            id(resampler_state),
+            resampler_state.key.channel_id,
+            resampler_state.source_sample_rate,
+            resampler_state.key.target_sample_rate,
+            resampler_state.key.target_bit_depth,
+            resampler_state.key.target_sample_type,
+            resampler_state.is_passthrough,
+            input_timestamp_us,
+            initial_pending_us,
+            reset_fired,
+            output_start_ts,
+            output_samples,
+            duration_us,
+            resampler_state.pending_timestamp_us,
+        )
+
     # Calculate sample count from input
     bytes_per_sample = source_format.bit_depth // 8
     frame_stride = bytes_per_sample * source_format.channels
@@ -436,6 +479,11 @@ def _resample_pcm_standalone(
     )
 
     if sample_count == 0:
+        _emit_resample_call_trace(
+            output_start_ts=resampler_state.pending_timestamp_us,
+            output_samples=0,
+            duration_us=0,
+        )
         return _ResampledPCM(
             pcm_data=b"",
             output_start_ts=resampler_state.pending_timestamp_us,
@@ -449,6 +497,11 @@ def _resample_pcm_standalone(
         output_start_ts = resampler_state.pending_timestamp_us
         duration_us = int(sample_count * 1_000_000 / resampler_state.key.target_sample_rate)
         resampler_state.pending_timestamp_us += duration_us
+        _emit_resample_call_trace(
+            output_start_ts=output_start_ts,
+            output_samples=sample_count,
+            duration_us=duration_us,
+        )
         return _ResampledPCM(
             pcm_data=av_input_pcm,
             output_start_ts=output_start_ts,
@@ -490,6 +543,11 @@ def _resample_pcm_standalone(
     duration_us = int(output_sample_count * 1_000_000 / resampler_state.key.target_sample_rate)
     resampler_state.pending_timestamp_us += duration_us
 
+    _emit_resample_call_trace(
+        output_start_ts=output_start_ts,
+        output_samples=output_sample_count,
+        duration_us=duration_us,
+    )
     return _ResampledPCM(
         pcm_data=bytes(out_pcm),
         output_start_ts=output_start_ts,
