@@ -41,11 +41,19 @@ class PcmPassthrough:
         # Calculate frame size: samples = sample_rate * duration_s
         # For 48kHz, 25ms: 48000 * 0.025 = 1200 samples
         # Frame size = samples * frame_stride = 1200 * 4 = 4800 bytes
-        chunk_samples = int(sample_rate * chunk_duration_us / 1_000_000)
-        self._frame_size = chunk_samples * self._frame_stride
+        self._chunk_samples = int(sample_rate * chunk_duration_us / 1_000_000)
+        self._frame_size = self._chunk_samples * self._frame_stride
         self._buffer = bytearray()
         # Track timestamp of the first sample in the buffer
         self._pending_timestamp_us: int | None = None
+        # Drift-free timestamp accumulator. Each emitted frame represents exactly
+        # `chunk_samples / sample_rate` seconds of audio. For sample rates where
+        # `chunk_samples * 1_000_000` is not divisible by `sample_rate` (e.g.
+        # 44.1kHz/25ms = 1102 samples = 24988.66µs), advancing pending by a fixed
+        # `chunk_duration_us` accumulates per-frame drift (~11µs/frame at
+        # 44.1k/25ms). The residue here tracks the unconsumed numerator across
+        # frames so cumulative pending exactly matches sample-derived elapsed time.
+        self._ts_residue: int = 0
         # Track last input timestamp to detect production gaps
         self._last_input_timestamp_us: int | None = None
 
@@ -75,8 +83,11 @@ class PcmPassthrough:
         if self._last_input_timestamp_us is not None:
             input_gap = timestamp_us - self._last_input_timestamp_us
             if input_gap > 1_500_000:  # 1.5s threshold
-                # Production gap detected - reset timestamp tracking
+                # Production gap detected - reset timestamp tracking. Reset the
+                # residue too: we're rebasing pending onto a fresh anchor and any
+                # carried fractional µs from the prior segment are stale.
                 self._pending_timestamp_us = timestamp_us
+                self._ts_residue = 0
         self._last_input_timestamp_us = timestamp_us
 
         # Track timestamp of first buffered sample (only if not already set)
@@ -90,9 +101,14 @@ class PcmPassthrough:
             frame = bytes(self._buffer[: self._frame_size])
             del self._buffer[: self._frame_size]
             frames.append(frame)
-            # Advance pending timestamp by one frame duration
+            # Advance pending timestamp using rational arithmetic. Each frame
+            # represents exactly `chunk_samples / sample_rate` seconds. Tracking
+            # the residue avoids the systematic per-frame drift that occurs when
+            # `chunk_samples * 1_000_000` is not divisible by `sample_rate`.
             if self._pending_timestamp_us is not None:
-                self._pending_timestamp_us += self._chunk_duration_us
+                self._ts_residue += self._chunk_samples * 1_000_000
+                delta_us, self._ts_residue = divmod(self._ts_residue, self._sample_rate)
+                self._pending_timestamp_us += delta_us
 
         return frames
 
@@ -111,6 +127,7 @@ class PcmPassthrough:
         frame = bytes(self._buffer)
         self._buffer.clear()
         self._pending_timestamp_us = None
+        self._ts_residue = 0
         return [frame]
 
     def get_header(self) -> bytes | None:
@@ -121,6 +138,7 @@ class PcmPassthrough:
         """Reset internal buffer."""
         self._buffer.clear()
         self._pending_timestamp_us = None
+        self._ts_residue = 0
         self._last_input_timestamp_us = None
 
 
@@ -173,10 +191,18 @@ class FlacEncoder:
 
     @property
     def pending_timestamp_us(self) -> int | None:
-        """Timestamp of the next output frame, or None if stream not started."""
+        """Timestamp of the next output frame, or None if stream not started.
+
+        Uses exact rational arithmetic (`samples * 1e6 // sample_rate`) instead of
+        accumulating `chunk_duration_us` to avoid drift when sample_rate doesn't
+        divide cleanly into chunk_samples * 1e6 (e.g. 44.1kHz).
+        """
         if self._stream_start_timestamp_us is None:
             return None
-        return self._stream_start_timestamp_us + self._output_frame_count * self._chunk_duration_us
+        cumulative_samples = self._output_frame_count * self._chunk_samples
+        return self._stream_start_timestamp_us + (
+            cumulative_samples * 1_000_000 // self._sample_rate
+        )
 
     def _ensure_initialized(self) -> None:
         """Lazily initialize encoder on first use."""
@@ -282,9 +308,14 @@ class FlacEncoder:
                 if self._stream_start_timestamp_us is None:
                     assert self._first_input_timestamp_us is not None
                     encoder_delay_chunks = max(self._chunks_encoded_total - 1, 0)
-                    self._stream_start_timestamp_us = (
-                        self._first_input_timestamp_us
-                        + encoder_delay_chunks * self._chunk_duration_us
+                    # Exact rational arithmetic: total samples consumed before
+                    # the encoder produced its first packet. Using
+                    # `chunks * _chunk_duration_us` would accumulate per-frame
+                    # truncation drift at sample rates where chunk_samples * 1e6
+                    # doesn't divide evenly into sample_rate (e.g. 44.1k).
+                    delay_samples = encoder_delay_chunks * self._chunk_samples
+                    self._stream_start_timestamp_us = self._first_input_timestamp_us + (
+                        delay_samples * 1_000_000 // self._sample_rate
                     )
                 frames.append(encoded)
                 # Count output frames for timestamp calculation
@@ -386,10 +417,20 @@ class OpusEncoder:
 
     @property
     def pending_timestamp_us(self) -> int | None:
-        """Timestamp of the next output frame, or None if stream not started."""
+        """Timestamp of the next output frame, or None if stream not started.
+
+        Uses exact rational arithmetic (`samples * 1e6 // sample_rate`) instead of
+        accumulating `chunk_duration_us`. Opus only allows sample rates where the
+        product divides cleanly today (8/12/16/24/48 kHz at 960 samples), so this
+        is currently equivalent to the old formula — but the rational version is
+        future-proof against any new chunk_size or rate that doesn't divide.
+        """
         if self._stream_start_timestamp_us is None:
             return None
-        return self._stream_start_timestamp_us + self._output_frame_count * self._chunk_duration_us
+        cumulative_samples = self._output_frame_count * self._chunk_samples
+        return self._stream_start_timestamp_us + (
+            cumulative_samples * 1_000_000 // self._sample_rate
+        )
 
     def _ensure_initialized(self) -> None:
         """Lazily initialize encoder on first use."""
@@ -479,9 +520,11 @@ class OpusEncoder:
                 if self._stream_start_timestamp_us is None:
                     assert self._first_input_timestamp_us is not None
                     encoder_delay_chunks = max(self._chunks_encoded_total - 1, 0)
-                    self._stream_start_timestamp_us = (
-                        self._first_input_timestamp_us
-                        + encoder_delay_chunks * self._chunk_duration_us
+                    # Exact rational arithmetic for encoder-delay compensation;
+                    # see FlacEncoder for full rationale.
+                    delay_samples = encoder_delay_chunks * self._chunk_samples
+                    self._stream_start_timestamp_us = self._first_input_timestamp_us + (
+                        delay_samples * 1_000_000 // self._sample_rate
                     )
                 frames.append(encoded)
                 self._output_frame_count += 1

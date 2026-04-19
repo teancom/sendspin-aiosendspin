@@ -264,6 +264,13 @@ class _ResamplerState:
     """True when resampler output is s32 but wire PCM is packed s24."""
     pending_timestamp_us: int | None = None
     """Timestamp of the earliest audio sample not yet emitted by this resampler."""
+    pending_ts_residue: int = 0
+    """Drift-free residue accumulator for `pending_timestamp_us`. Each call advances
+    pending by `output_samples * 1_000_000 / target_sample_rate`. For target rates
+    where this isn't a whole number (e.g. 44.1kHz), `int(...)` truncation accumulates
+    backward drift over time. We track the unconsumed numerator across calls so
+    cumulative pending exactly matches sample-derived elapsed time. Reset to 0
+    whenever pending is rebased onto a fresh anchor (drift_reset, init)."""
     is_passthrough: bool = False
     """True when source and target formats are identical — skip graph processing."""
 
@@ -363,6 +370,7 @@ def _resample_pcm_standalone(
     # Handle timestamp tracking
     if resampler_state.pending_timestamp_us is None:
         resampler_state.pending_timestamp_us = input_timestamp_us
+        resampler_state.pending_ts_residue = 0
     else:
         # Resync if timestamp drifts too far (e.g., resampler was idle)
         drift_us = abs(resampler_state.pending_timestamp_us - input_timestamp_us)
@@ -385,6 +393,9 @@ def _resample_pcm_standalone(
                     dither_method=resampler_state.key.dither_method,
                 )
             resampler_state.pending_timestamp_us = input_timestamp_us
+            # Reset the residue accumulator: pending has been rebased onto a fresh
+            # anchor and any carried fractional µs from the prior segment are stale.
+            resampler_state.pending_ts_residue = 0
 
     # Calculate sample count from input
     bytes_per_sample = source_format.bit_depth // 8
@@ -416,7 +427,14 @@ def _resample_pcm_standalone(
     # Fast path: no conversion needed — return input PCM with timestamp tracking
     if resampler_state.is_passthrough:
         output_start_ts = resampler_state.pending_timestamp_us
-        duration_us = int(sample_count * 1_000_000 / resampler_state.key.target_sample_rate)
+        # Drift-free advance: track the fractional µs across calls. Plain
+        # `int(samples * 1e6 / sample_rate)` accumulates per-call truncation
+        # error for rates that don't divide cleanly into 1e6 (e.g. 44.1k).
+        resampler_state.pending_ts_residue += sample_count * 1_000_000
+        duration_us, resampler_state.pending_ts_residue = divmod(
+            resampler_state.pending_ts_residue,
+            resampler_state.key.target_sample_rate,
+        )
         resampler_state.pending_timestamp_us += duration_us
         return _ResampledPCM(
             pcm_data=av_input_pcm,
@@ -455,8 +473,13 @@ def _resample_pcm_standalone(
 
     output_start_ts = resampler_state.pending_timestamp_us
 
-    # Update pending timestamp based on output samples
-    duration_us = int(output_sample_count * 1_000_000 / resampler_state.key.target_sample_rate)
+    # Update pending timestamp based on output samples — same drift-free
+    # accumulator as the passthrough fast path. See note above.
+    resampler_state.pending_ts_residue += output_sample_count * 1_000_000
+    duration_us, resampler_state.pending_ts_residue = divmod(
+        resampler_state.pending_ts_residue,
+        resampler_state.key.target_sample_rate,
+    )
     resampler_state.pending_timestamp_us += duration_us
 
     return _ResampledPCM(

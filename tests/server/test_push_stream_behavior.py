@@ -2639,3 +2639,151 @@ async def test_zero_delay_regression_commit_audio_unchanged() -> None:
     play_start = await stream.commit_audio()
 
     assert play_start == clock.now_us() + DEFAULT_INITIAL_DELAY_US
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the resampler timestamp-drift bug.
+# ---------------------------------------------------------------------------
+#
+# `_resample_pcm_standalone` advances `pending_timestamp_us` per call by
+# `int(output_samples * 1_000_000 / target_sample_rate)`. When the divisor
+# does not divide cleanly (e.g. 44.1kHz with 1102 samples = 24988.66µs), the
+# `int(...)` truncation accumulates per-call drift. Combined with the matching
+# bug in `PcmPassthrough`, this produced the cliff at the 500ms transformer
+# drift threshold documented in `/tmp/sendspin-handoff-v4.md`.
+#
+# The fix uses an integer residue accumulator on `_ResamplerState` so cumulative
+# pending exactly matches `total_output_samples * 1_000_000 // target_rate`.
+
+
+def _make_resampler_state_passthrough(
+    *, sample_rate: int, bit_depth: int = 16, channels: int = 2
+) -> push_stream_module._ResamplerState:  # type: ignore[name-defined]
+    """Build a passthrough resampler state at the given target rate."""
+    fmt = AudioFormat(
+        sample_rate=sample_rate, bit_depth=bit_depth, channels=channels, sample_type="int"
+    )
+    key = push_stream_module._ResamplerKey(  # noqa: SLF001
+        channel_id=MAIN_CHANNEL,
+        source_format=fmt,
+        target_sample_rate=sample_rate,
+        target_channels=channels,
+        target_bit_depth=bit_depth,
+        target_sample_type="int",
+    )
+    return push_stream_module._create_resampler_state(key, fmt, fmt)  # noqa: SLF001
+
+
+def test_resampler_passthrough_44100_no_drift_per_call() -> None:
+    """Passthrough @ 44.1k with 1102 samples advances pending by 24988µs (not 24988.66)."""
+    state = _make_resampler_state_passthrough(sample_rate=44100)
+    fmt = AudioFormat(sample_rate=44100, bit_depth=16, channels=2, sample_type="int")
+    pcm = bytes(1102 * 4)  # 1102 stereo s16 samples
+    result = push_stream_module._resample_pcm_standalone(state, pcm, fmt, 0)  # noqa: SLF001
+    assert result.output_start_ts == 0
+    assert state.pending_timestamp_us == 24988  # int(1102 * 1e6 / 44100)
+
+
+def test_resampler_passthrough_44100_no_cumulative_drift() -> None:
+    """After 10k passthrough calls @ 44.1k, pending == sample-derived elapsed time exactly."""
+    state = _make_resampler_state_passthrough(sample_rate=44100)
+    fmt = AudioFormat(sample_rate=44100, bit_depth=16, channels=2, sample_type="int")
+    pcm_one_chunk = bytes(1102 * 4)
+    n_calls = 10_000
+    # Each call advances input_ts by exactly 1102 samples worth of µs (using
+    # rational arithmetic on the input side too).
+    input_residue = 0
+    input_ts = 0
+    for _ in range(n_calls):
+        push_stream_module._resample_pcm_standalone(  # noqa: SLF001
+            state, pcm_one_chunk, fmt, input_ts
+        )
+        input_residue += 1102 * 1_000_000
+        delta, input_residue = divmod(input_residue, 44100)
+        input_ts += delta
+
+    # Cumulative pending must equal n_calls * 1102 * 1_000_000 // 44100 exactly.
+    expected = n_calls * 1102 * 1_000_000 // 44100
+    assert state.pending_timestamp_us == expected, (
+        f"resampler accumulated {state.pending_timestamp_us - expected}µs of "
+        f"drift over {n_calls} calls — regression of the per-call truncation bug"
+    )
+
+
+def test_resampler_passthrough_drift_reset_clears_residue() -> None:
+    """Resampler drift-reset path (>20ms input/pending mismatch) must reset residue."""
+    state = _make_resampler_state_passthrough(sample_rate=44100)
+    fmt = AudioFormat(sample_rate=44100, bit_depth=16, channels=2, sample_type="int")
+    pcm = bytes(1102 * 4)
+    # Prime with a few calls so residue accumulates
+    for i in range(5):
+        push_stream_module._resample_pcm_standalone(state, pcm, fmt, i * 24988)  # noqa: SLF001
+    # Now jump input forward by 5 seconds — way beyond the 20ms drift threshold
+    new_input_ts = 10_000_000
+    push_stream_module._resample_pcm_standalone(state, pcm, fmt, new_input_ts)  # noqa: SLF001
+    # After the rebase + one fresh call: pending should be new_input_ts + 24988
+    # (one chunk's worth from the fresh anchor, with residue having been reset to 0)
+    assert state.pending_timestamp_us == new_input_ts + 24988
+    # And the residue carried into the next call should reflect ONE call worth
+    # (i.e. residue == 1102 * 1_000_000 % 44100 = 14800)
+    assert state.pending_ts_residue == 1102 * 1_000_000 % 44100
+
+
+def test_resampler_passthrough_48000_zero_drift() -> None:
+    """At 48kHz/25ms (clean rate), drift is zero with old or new code — sanity check."""
+    state = _make_resampler_state_passthrough(sample_rate=48000)
+    fmt = AudioFormat(sample_rate=48000, bit_depth=16, channels=2, sample_type="int")
+    pcm = bytes(1200 * 4)
+    push_stream_module._resample_pcm_standalone(state, pcm, fmt, 0)  # noqa: SLF001
+    assert state.pending_timestamp_us == 25_000
+
+
+def test_resampler_passthrough_initial_state_has_zero_residue() -> None:
+    """Freshly created _ResamplerState starts with residue=0."""
+    state = _make_resampler_state_passthrough(sample_rate=44100)
+    assert state.pending_ts_residue == 0
+    assert state.pending_timestamp_us is None
+
+
+def test_resampler_graph_path_44100_no_cumulative_drift() -> None:
+    """48k→44.1k resample via the actual PyAV graph path — the path that triggered the bug."""
+    source = AudioFormat(sample_rate=48_000, bit_depth=16, channels=2, sample_type="int")
+    target = AudioFormat(sample_rate=44_100, bit_depth=16, channels=2, sample_type="int")
+    key = push_stream_module._ResamplerKey(  # noqa: SLF001
+        channel_id=MAIN_CHANNEL,
+        source_format=source,
+        target_sample_rate=44_100,
+        target_channels=2,
+        target_bit_depth=16,
+        target_sample_type="int",
+    )
+    state = push_stream_module._create_resampler_state(key, source, target)  # noqa: SLF001
+    assert not state.is_passthrough  # exercising the graph path
+
+    # Push N calls of 25ms @ 48k = 1200 input samples each
+    n_calls = 1000
+    input_pcm = bytes(1200 * 4)
+    input_residue = 0
+    input_ts = 0
+    total_output_samples = 0
+    last_pending = 0
+    for _ in range(n_calls):
+        result = push_stream_module._resample_pcm_standalone(  # noqa: SLF001
+            state, input_pcm, source, input_ts
+        )
+        total_output_samples += result.sample_count
+        last_pending = state.pending_timestamp_us or 0
+        input_residue += 1200 * 1_000_000
+        delta, input_residue = divmod(input_residue, 48_000)
+        input_ts += delta
+
+    # Cumulative pending must exactly equal total_output_samples * 1e6 // 44100.
+    # The graph may produce a slightly variable sample count per call due to
+    # FFmpeg's filter buffering, but cumulative is what must be drift-free.
+    expected = total_output_samples * 1_000_000 // 44_100
+    drift = last_pending - expected
+    assert drift == 0, (
+        f"graph-path resampler drifted {drift}µs over {n_calls} calls "
+        f"({total_output_samples} output samples) — regression of the per-call "
+        f"truncation bug at push_stream.py:574"
+    )
