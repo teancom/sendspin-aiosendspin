@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ from aiosendspin.models.player import (
 from aiosendspin.models.types import AudioCodec, PlayerCommand, Roles
 from aiosendspin.server import push_stream as push_stream_module
 from aiosendspin.server.audio import AudioFormat
-from aiosendspin.server.audio_transformers import TransformerPool
+from aiosendspin.server.audio_transformers import TransformerPool, TransformKey
 from aiosendspin.server.channels import MAIN_CHANNEL
 from aiosendspin.server.client import SendspinClient
 from aiosendspin.server.clock import LoopClock, ManualClock
@@ -2639,3 +2640,287 @@ async def test_zero_delay_regression_commit_audio_unchanged() -> None:
     play_start = await stream.commit_audio()
 
     assert play_start == clock.now_us() + DEFAULT_INITIAL_DELAY_US
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the transformer cliff bug (encoder fallback emitting
+# backward when drift crosses the threshold in the narrow asymmetric window).
+# ---------------------------------------------------------------------------
+#
+# Bug: in `_encode_transform_for_key`, the drift-reset gate uses
+#     |pending - (output_ts + duration_us)| > 500_000
+# while the cliff check in `_encode_for_transform_key` evaluates
+#     |pending_post_process - len(frames) * frame_dur - output_ts| > 500_000
+# For PcmPassthrough at 44.1k/25ms these reduce (after process() advances
+# pending by duration_us) to:
+#     reset gate  -> |drift - duration_us| > 500_000
+#     cliff check -> |drift|              > 500_000
+# i.e. a duration_us-sized window (500_001..525_000µs of drift) where the
+# cliff falls back to `base_ts = output_ts` but the reset gate has not fired.
+# The previous commit's emission was at `candidate_base` (~500ms above
+# `output_ts`), so the cliff-triggered emission drops backward by ~475ms.
+#
+# The fix is layered:
+#   (1) align the reset-gate formula to |pending - output_ts| so the reset
+#       fires before the cliff can ever enter its fallback branch,
+#   (2) track per-tkey last-emitted-end state and clamp emissions to be
+#       monotonically non-decreasing vs prior emissions (defensive invariant),
+#   (3) warn on both reset activation and monotonicity clamp activation.
+
+
+class TestEncoderCliffHardening:
+    """Regression tests for the transformer cliff bug fix."""
+
+    @staticmethod
+    def _make_stream() -> PushStream:
+        group = _DummyGroup(clients=[])
+        return PushStream(loop=MagicMock(), clock=ManualClock(), group=group)
+
+    @staticmethod
+    def _make_transformer(sample_rate: int = 44_100) -> PcmPassthrough:
+        return PcmPassthrough(sample_rate=sample_rate, bit_depth=16, channels=2)
+
+    @staticmethod
+    def _make_tkey(sample_rate: int = 44_100) -> TransformKey:
+        return TransformKey(
+            channel_id=0,
+            transformer_type=PcmPassthrough,
+            sample_rate=sample_rate,
+            bit_depth=16,
+            channels=2,
+            frame_duration_us=25_000,
+            options=(),
+        )
+
+    @staticmethod
+    def _pcm_chunk_25ms_44100_s16_stereo() -> bytes:
+        # 1102 samples @ 25ms @ 44.1k * 2 bytes (s16) * 2 channels = 4408 bytes.
+        return bytes(4408)
+
+    def test_drift_triggers_reset_with_one_clean_re_anchor(self) -> None:
+        """Drift crossing the threshold re-anchors cleanly and resumes forward.
+
+        The design intent is a single backward "quick jerk" when the server
+        detects it has drifted more than ``_TRANSFORMER_DRIFT_THRESHOLD_US``
+        ahead of the real audio timeline, followed by normal forward-only
+        emission. NOT a permanent forward offset (which would silently desync
+        multi-player groups), NOT rapid-fire repeated backward emissions
+        (the original cliff bug's failure mode — the asymmetric reset/cliff
+        formulas kept the cliff fallback firing for ~50 seconds).
+
+        Verifies the post-reset behavior:
+          - The reset-event emission re-anchors to output_ts (backward vs the
+            drifted high-water mark is expected and acceptable — one jerk).
+          - Subsequent emissions proceed monotonically forward from there.
+          - The cliff fallback inside _encode_for_transform_key is not
+            re-entered: cliff check passes cleanly post-reset.
+        """
+        stream = self._make_stream()
+        transformer = self._make_transformer(sample_rate=44_100)
+        tkey = self._make_tkey(sample_rate=44_100)
+        pcm_chunk = self._pcm_chunk_25ms_44100_s16_stereo()
+        duration_us = 25_000
+
+        # Commit 1 at output_ts=0 establishes pending=25_000 and emits at ts=0.
+        emissions_1 = stream._encode_transform_for_key(  # noqa: SLF001
+            tkey, transformer, pcm_chunk, 0, duration_us
+        )
+        assert emissions_1[0][1] == 0
+
+        # Simulate ~16 minutes of bug-1 drift by forcing pending ahead of
+        # output_ts, still inside the reset threshold. This emits at the
+        # drifted candidate_base — setting up a high high-water mark that a
+        # naive post-reset emission would appear to step backward from.
+        transformer._pending_timestamp_us = 524_000  # noqa: SLF001
+        emissions_2 = stream._encode_transform_for_key(  # noqa: SLF001
+            tkey, transformer, pcm_chunk, 25_000, duration_us
+        )
+        assert emissions_2[0][1] == 524_000
+        second_emit_end = emissions_2[0][1] + emissions_2[0][2]
+        assert second_emit_end == 549_000
+
+        # Push drift past the aligned reset threshold. With Fix #2 Part A
+        # (aligned formula), reset fires here. With Part B' (clear anchor on
+        # reset), the clamp does not preserve the stale high-water mark —
+        # this single post-reset emission is allowed to land at output_ts.
+        transformer._pending_timestamp_us = 560_000  # noqa: SLF001
+        emissions_3 = stream._encode_transform_for_key(  # noqa: SLF001
+            tkey, transformer, pcm_chunk, 50_000, duration_us
+        )
+        third_emit_ts = emissions_3[0][1]
+        # Reset re-anchored the timeline to output_ts. One backward jerk vs
+        # second_emit_end=549_000 is the intended behavior.
+        assert third_emit_ts == 50_000, (
+            f"Expected re-anchor to output_ts=50_000, got {third_emit_ts}"
+        )
+        # Transformer pending now reflects the post-reset state: re-seeded
+        # to output_ts_new=50_000 and advanced one frame.
+        assert transformer.pending_timestamp_us == 75_000
+
+        # All subsequent emissions must be monotonically forward from the
+        # re-anchor. No more backward jumps until drift re-accumulates past
+        # threshold (~17 more minutes at bug-1's 12µs/commit rate).
+        prev_emit_end = third_emit_ts + emissions_3[0][2]
+        for k in range(3, 8):
+            output_ts_k = k * 25_000
+            emissions = stream._encode_transform_for_key(  # noqa: SLF001
+                tkey, transformer, pcm_chunk, output_ts_k, duration_us
+            )
+            assert len(emissions) == 1
+            this_emit_ts = emissions[0][1]
+            assert this_emit_ts >= prev_emit_end, (
+                f"Post-reset emission went backward at k={k}: "
+                f"prev_end={prev_emit_end} this_ts={this_emit_ts}"
+            )
+            prev_emit_end = this_emit_ts + emissions[0][2]
+
+    def test_normal_operation_unchanged_by_hardening(self) -> None:
+        """Steady-state emissions (no drift) must not be clamped or shifted."""
+        stream = self._make_stream()
+        transformer = self._make_transformer(sample_rate=44_100)
+        tkey = self._make_tkey(sample_rate=44_100)
+        pcm_chunk = self._pcm_chunk_25ms_44100_s16_stereo()
+        duration_us = 25_000
+
+        emitted_ts: list[int] = []
+        for k in range(6):
+            emissions = stream._encode_transform_for_key(  # noqa: SLF001
+                tkey, transformer, pcm_chunk, k * 25_000, duration_us
+            )
+            assert len(emissions) == 1
+            emitted_ts.append(emissions[0][1])
+
+        # Each emission should land at its input output_ts (drift-free steady state).
+        assert emitted_ts == [0, 25_000, 50_000, 75_000, 100_000, 125_000]
+        # Deltas are exactly frame_dur — no clamp activations shifted anything.
+        deltas = [b - a for a, b in itertools.pairwise(emitted_ts)]
+        assert all(d == 25_000 for d in deltas), deltas
+
+    def test_clamp_still_protects_when_reset_does_not_fire(self) -> None:
+        """Clamp catches non-reset backward emissions (gap rebase, etc).
+
+        If drift is UNDER the reset threshold but something else causes the
+        transformer to emit a ts behind the previous emission (e.g., an
+        input-gap rebase inside PcmPassthrough, a transient encoder reset, a
+        future bug), the clamp still shifts forward to preserve monotonicity.
+        The on-reset anchor clear ONLY happens for the drift-threshold reset
+        path, not for other emission-backward scenarios.
+        """
+        stream = self._make_stream()
+        transformer = self._make_transformer(sample_rate=44_100)
+        tkey = self._make_tkey(sample_rate=44_100)
+        pcm_chunk = self._pcm_chunk_25ms_44100_s16_stereo()
+        duration_us = 25_000
+
+        # Drive commit 1 so last_emitted_end=25_000 gets tracked.
+        stream._encode_transform_for_key(  # noqa: SLF001
+            tkey, transformer, pcm_chunk, 0, duration_us
+        )
+        assert stream._transform_last_emitted_end_us[tkey] == 25_000  # noqa: SLF001
+
+        # Push pending BACKWARD — a synthetic scenario where pending has moved
+        # below the last-emitted timeline but drift is still tiny so no reset.
+        # Without the clamp, the next emission would be at candidate_base=0,
+        # backward vs the prior emission ending at 25_000.
+        transformer._pending_timestamp_us = 10_000  # noqa: SLF001
+
+        emissions = stream._encode_transform_for_key(  # noqa: SLF001
+            tkey, transformer, pcm_chunk, 10_000, duration_us
+        )
+        assert len(emissions) == 1
+        assert emissions[0][1] >= 25_000, (
+            f"Clamp failed to catch backward emission: ts={emissions[0][1]}"
+        )
+
+    def test_reset_gate_fires_with_aligned_formula(self) -> None:
+        """Drift > 500_000µs triggers reset before the cliff fallback runs.
+
+        The old gate (``|pending - (output_ts + duration_us)|``) only fired at
+        drift > 525_000µs, leaving a 25_000µs window where the cliff fallback
+        ran silently. The aligned gate (``|pending - output_ts|``) fires at
+        exactly the same threshold the cliff uses.
+        """
+        stream = self._make_stream()
+        transformer = self._make_transformer(sample_rate=44_100)
+        tkey = self._make_tkey(sample_rate=44_100)
+        pcm_chunk = self._pcm_chunk_25ms_44100_s16_stereo()
+        duration_us = 25_000
+
+        # Prime the transformer with one commit (output_ts=0).
+        stream._encode_transform_for_key(  # noqa: SLF001
+            tkey, transformer, pcm_chunk, 0, duration_us
+        )
+
+        # Force pending to be 510_000µs ahead of the next commit's output_ts.
+        # This is inside the old pre-fix window where only the cliff would fire,
+        # but the aligned reset gate should now fire here too.
+        transformer._pending_timestamp_us = 25_000 + 510_000  # noqa: SLF001
+        pending_before = transformer.pending_timestamp_us
+        assert pending_before == 535_000
+
+        stream._encode_transform_for_key(  # noqa: SLF001
+            tkey, transformer, pcm_chunk, 25_000, duration_us
+        )
+
+        # After reset, the transformer's pending was cleared (None), then
+        # process() re-seeded it to input_ts=25_000 and advanced by one frame
+        # to 50_000.  If the reset had NOT fired, pending would have advanced
+        # from 535_000 to 560_000.  The value 50_000 proves the reset fired.
+        assert transformer.pending_timestamp_us == 50_000
+
+
+class TestClampEmissionsMonotonic:
+    """Direct unit tests for the _clamp_emissions_monotonic helper."""
+
+    def test_empty_frames_returns_empty(self) -> None:
+        """Empty input with no prior emission returns empty and new_end=0."""
+        frames, new_end = push_stream_module._clamp_emissions_monotonic([], None)  # noqa: SLF001
+        assert frames == []
+        assert new_end == 0
+
+    def test_empty_frames_preserves_last_end(self) -> None:
+        """Empty input must not advance the tracked last_emitted_end."""
+        frames, new_end = push_stream_module._clamp_emissions_monotonic([], 12345)  # noqa: SLF001
+        assert frames == []
+        assert new_end == 12345
+
+    def test_first_call_no_history_no_clamp(self) -> None:
+        """Frames pass through unchanged when there is no prior emission."""
+        frames = [(b"a", 0, 25_000), (b"b", 25_000, 25_000)]
+        out, new_end = push_stream_module._clamp_emissions_monotonic(frames, None)  # noqa: SLF001
+        assert out == frames
+        assert new_end == 50_000  # last_ts + last_dur
+
+    def test_forward_emission_not_shifted(self) -> None:
+        """Frames landing at or after last_emitted_end are not modified."""
+        # last_emitted_end=100_000; first frame at 100_000 is exactly at the
+        # boundary and must not be shifted forward.
+        frames = [(b"a", 100_000, 25_000), (b"b", 125_000, 25_000)]
+        out, new_end = push_stream_module._clamp_emissions_monotonic(  # noqa: SLF001
+            frames, 100_000
+        )
+        assert out == frames
+        assert new_end == 150_000
+
+    def test_backward_emission_shifted_forward(self) -> None:
+        """Backward frames are shifted so the first lands at last_emitted_end."""
+        # Prior emission ended at 524_000 (drifted emission). Cliff fallback
+        # produced frames at output_ts=50_000. Clamp must shift all frames so
+        # the first lands at 524_000.
+        frames = [(b"a", 50_000, 25_000), (b"b", 75_000, 25_000)]
+        out, new_end = push_stream_module._clamp_emissions_monotonic(  # noqa: SLF001
+            frames, 524_000
+        )
+        # shift = 524_000 - 50_000 = 474_000
+        assert out == [(b"a", 524_000, 25_000), (b"b", 549_000, 25_000)]
+        assert new_end == 574_000
+
+    def test_shift_preserves_relative_spacing(self) -> None:
+        """Shifted frames maintain the same inter-frame spacing as the input."""
+        frames = [(b"x", 0, 10_000), (b"y", 10_000, 10_000), (b"z", 20_000, 10_000)]
+        out, _new_end = push_stream_module._clamp_emissions_monotonic(  # noqa: SLF001
+            frames, 100_000
+        )
+        # All frames shifted by +100_000; spacing preserved.
+        assert [f[1] for f in out] == [100_000, 110_000, 120_000]
+        assert all(f[2] == 10_000 for f in out)

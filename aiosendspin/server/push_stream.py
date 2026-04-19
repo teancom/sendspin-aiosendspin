@@ -219,6 +219,50 @@ def _encode_for_transform_key(
     return [(data, base_ts + i * frame_dur, frame_dur) for i, data in enumerate(frames)]
 
 
+def _clamp_emissions_monotonic(
+    frames: list[tuple[bytes, int, int]],
+    last_emitted_end_us: int | None,
+) -> tuple[list[tuple[bytes, int, int]], int]:
+    """Clamp emission timestamps to enforce the monotonicity invariant.
+
+    If the first frame's timestamp would land before ``last_emitted_end_us``,
+    shift every frame in ``frames`` forward by the same delta so the first
+    frame aligns with ``last_emitted_end_us``.  Subsequent frames preserve
+    their relative spacing by construction.
+
+    This is a defensive layer that makes backward emissions structurally
+    impossible at the transformer boundary, regardless of upstream drift or
+    edge cases in ``_encode_for_transform_key``'s cliff fallback.  When the
+    clamp activates, it emits a WARNING log so silent correction is visible.
+
+    Returns:
+        A tuple ``(adjusted_frames, new_last_emitted_end_us)``.  When
+        ``frames`` is empty the returned ``new_last_emitted_end_us`` is
+        ``last_emitted_end_us`` unchanged (or ``0`` if it was ``None``).
+    """
+    if not frames:
+        return frames, last_emitted_end_us if last_emitted_end_us is not None else 0
+
+    first_ts = frames[0][1]
+    last_frame_ts, last_frame_dur = frames[-1][1], frames[-1][2]
+
+    if last_emitted_end_us is None or first_ts >= last_emitted_end_us:
+        return frames, last_frame_ts + last_frame_dur
+
+    shift = last_emitted_end_us - first_ts
+    _LOGGER.warning(
+        "Transformer emission clamped for monotonicity: "
+        "first_ts=%d last_emitted_end=%d shift_us=%d frame_count=%d",
+        first_ts,
+        last_emitted_end_us,
+        shift,
+        len(frames),
+    )
+    shifted = [(data, ts + shift, dur) for data, ts, dur in frames]
+    new_last_end = shifted[-1][1] + shifted[-1][2]
+    return shifted, new_last_end
+
+
 class _ResamplerKey(NamedTuple):
     """Key for sharing resamplers: (channel_id, source_format, target PCM params).
 
@@ -622,6 +666,13 @@ class PushStream:
         self._transform_key_cache: dict[tuple[int, int], TransformKey] = {}
         # Last encoded input end timestamp per TransformKey for long-gap reset handling.
         self._transform_last_input_end_us: dict[TransformKey, int] = {}
+        # Last emitted frame end timestamp per TransformKey. Used by
+        # `_encode_transform_for_key` to clamp emissions and guarantee the
+        # monotonicity invariant: no emission ever lands before the prior
+        # emission's end.  This is a defensive layer that catches any cliff
+        # fallback or upstream drift that would otherwise produce a backward
+        # timestamp.
+        self._transform_last_emitted_end_us: dict[TransformKey, int] = {}
         # Roles awaiting delayed join; excluded from live delivery until join executes.
         self._pending_join_roles: weakref.WeakSet[Role] = weakref.WeakSet()
         # Historical audio buffers: channel_id -> list of (pcm_bytes, audio_format)
@@ -1310,6 +1361,11 @@ class PushStream:
 
         return tkey
 
+    def _forget_transform_tracking(self, tkey: TransformKey) -> None:
+        """Drop per-TransformKey tracking state (input end + emitted end)."""
+        self._transform_last_input_end_us.pop(tkey, None)
+        self._transform_last_emitted_end_us.pop(tkey, None)
+
     def _encode_transform_for_key(
         self,
         tkey: TransformKey,
@@ -1332,13 +1388,42 @@ class PushStream:
         # (when audio production is slower than real-time, each commit's rebase shifts
         # timestamps forward, but the transformer's internal timeline only advances by
         # the actual audio duration).
+        #
+        # Formula is |pending - output_ts| (not |pending - (output_ts + duration_us)|)
+        # to match the same basis used by the candidate_base cliff check inside
+        # _encode_for_transform_key. Before this alignment, a duration_us-wide window
+        # (drift = 500_001..525_000µs for 25ms PCM) existed where the cliff's fallback
+        # to `output_ts` would fire but this reset gate would not, producing a ~475ms
+        # backward-ts emission. Aligning the formulas makes the reset fire first in
+        # every scenario the cliff fallback could otherwise trigger.
         if (
             transformer is not None
             and transformer.pending_timestamp_us is not None
-            and abs(transformer.pending_timestamp_us - (output_ts + duration_us))
-            > _TRANSFORMER_DRIFT_THRESHOLD_US
+            and abs(transformer.pending_timestamp_us - output_ts) > _TRANSFORMER_DRIFT_THRESHOLD_US
         ):
+            _LOGGER.warning(
+                "Transformer drift threshold exceeded, resetting: "
+                "tkey_rate=%d pending_us=%d output_ts=%d drift_us=%d threshold_us=%d",
+                tkey.sample_rate,
+                transformer.pending_timestamp_us,
+                output_ts,
+                transformer.pending_timestamp_us - output_ts,
+                _TRANSFORMER_DRIFT_THRESHOLD_US,
+            )
             transformer.reset()
+            # Drop the monotonicity anchor in lockstep with the transformer
+            # reset. The reset is our deliberate signal that the prior timeline
+            # is invalid and we are re-anchoring to output_ts. Keeping the old
+            # last_emitted_end would force the clamp below to permanently shift
+            # every future emission forward by the drift amount — which
+            # silently lies about playback timing (two players running would
+            # drift apart exactly the way the cliff bug already does).
+            # Clearing it produces one clean backward re-sync ("quick jerk")
+            # and then correct forward progress until the next reset — which
+            # is the intended behavior for a drift-threshold event. The clamp
+            # below still protects emissions against OTHER backward-ts sources
+            # (production-gap rebases, transient encoder state).
+            self._transform_last_emitted_end_us.pop(tkey, None)
 
         encoded = _encode_for_transform_key(
             transformer,
@@ -1346,6 +1431,20 @@ class PushStream:
             output_ts,
             duration_us,
         )
+
+        # Defensive monotonicity clamp: even if the cliff fallback inside
+        # _encode_for_transform_key emits at output_ts (which can lag the prior
+        # emission during a drift-window transient), enforce that no emission
+        # lands before the prior emission's end for this TransformKey. This
+        # makes backward-ts emissions structurally impossible at the transformer
+        # boundary regardless of upstream state.
+        encoded, new_last_emitted_end = _clamp_emissions_monotonic(
+            encoded,
+            self._transform_last_emitted_end_us.get(tkey),
+        )
+        if encoded:
+            self._transform_last_emitted_end_us[tkey] = new_last_emitted_end
+
         self._transform_last_input_end_us[tkey] = output_ts + duration_us
         return encoded
 
@@ -1597,6 +1696,7 @@ class PushStream:
             if not self._other_roles_use_transform_key(tkey, role):
                 self._role_chunk_cache.pop(tkey, None)
                 self._transform_last_input_end_us.pop(tkey, None)
+                self._transform_last_emitted_end_us.pop(tkey, None)
                 if req.transformer is not None:
                     req.transformer.reset()
         for tkey in list(self._catchup_roles.keys()):
@@ -1617,6 +1717,7 @@ class PushStream:
                 self._transform_key_cache.pop(cache_key, None)
         for stale_tkey in stale_transform_keys:
             self._transform_last_input_end_us.pop(stale_tkey, None)
+            self._transform_last_emitted_end_us.pop(stale_tkey, None)
 
     def on_role_format_changed(self, role: Role) -> None:
         """Invalidate caches after a role's audio format changed mid-stream.
@@ -1634,6 +1735,7 @@ class PushStream:
                 self._transform_key_cache.pop(cache_key, None)
         for stale_tkey in stale_transform_keys:
             self._transform_last_input_end_us.pop(stale_tkey, None)
+            self._transform_last_emitted_end_us.pop(stale_tkey, None)
 
         # Clean up any catchup state referencing this role
         for tkey in list(self._catchup_roles.keys()):
@@ -1945,7 +2047,7 @@ class PushStream:
         try:
             if encoder is not None:
                 encoder.reset()
-            self._transform_last_input_end_us.pop(cache_key, None)
+            self._forget_transform_tracking(cache_key)
             pcm_chunks = list(self._pcm_chunk_cache.get(channel_int, []))
             align_to_channel_tail = channel_id != MAIN_CHANNEL
             target_ts = self.get_late_join_target_timestamp_us(
@@ -2096,6 +2198,7 @@ class PushStream:
         self._historical_buffers.clear()
         self._historical_start_us.clear()
         self._transform_last_input_end_us.clear()
+        self._transform_last_emitted_end_us.clear()
         self._channels_with_committed_audio.clear()
 
     def clear(self) -> None:
@@ -2119,6 +2222,7 @@ class PushStream:
         self._pending_join_roles.clear()
         self._pcm_chunk_cache.clear()
         self._transform_last_input_end_us.clear()
+        self._transform_last_emitted_end_us.clear()
         self._cancel_catchup_tasks()
 
         # Reset inline resamplers
