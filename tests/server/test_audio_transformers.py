@@ -189,9 +189,8 @@ class TestPcmPassthroughTimestampDrift:
     samples per frame. The actual duration of 1102 samples at 44.1kHz is
     1102 * 1_000_000 / 44100 = 24988.66µs, not 25_000µs. Advancing
     `pending_timestamp_us` by `chunk_duration_us = 25_000` per frame accumulated
-    +11.34µs of forward drift per frame, causing the dual-stream backward-ts
-    glitch documented in `/tmp/sendspin-handoff-v4.md` after ~17 minutes of
-    playback.
+    +11.34µs of forward drift per frame, causing a dual-stream backward-ts
+    glitch after ~17 minutes of playback.
 
     The fix uses rational arithmetic: pending advances by exactly
     `chunk_samples * 1_000_000 / sample_rate` per frame, with the fractional
@@ -302,15 +301,14 @@ class TestPcmPassthroughTimestampDrift:
         assert emitted[-1] == n * 25_000
 
     def test_passthrough_88200_no_drift(self) -> None:
-        """At 88.2kHz (multiple of 44.1k, also doesn't divide cleanly)."""
+        """At 88.2kHz/25ms (2205 samples = 25000µs exact), no drift."""
         transformer = PcmPassthrough(sample_rate=88200, bit_depth=24, channels=2)
         n = 5_000
         emitted = self._drive_n_frames(
             transformer, n_frames=n, sample_rate=88200, bit_depth=24, channels=2
         )
         # int(88200 * 25_000 / 1_000_000) = 2205 samples per frame
-        # 2205 * 1_000_000 / 88200 = 25000.0 exactly! 88.2k IS clean at 25ms.
-        # But verify our formula handles it:
+        # 2205 * 1_000_000 / 88200 = 25000.0 exactly — 88.2k divides cleanly at 25ms.
         chunk_samples = 2205
         expected = n * chunk_samples * 1_000_000 // 88200
         assert emitted[-1] == expected

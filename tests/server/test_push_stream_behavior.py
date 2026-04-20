@@ -2650,7 +2650,7 @@ async def test_zero_delay_regression_commit_audio_unchanged() -> None:
 # does not divide cleanly (e.g. 44.1kHz with 1102 samples = 24988.66µs), the
 # `int(...)` truncation accumulates per-call drift. Combined with the matching
 # bug in `PcmPassthrough`, this produced the cliff at the 500ms transformer
-# drift threshold documented in `/tmp/sendspin-handoff-v4.md`.
+# drift threshold in `_encode_for_transform_key`.
 #
 # The fix uses an integer residue accumulator on `_ResamplerState` so cumulative
 # pending exactly matches `total_output_samples * 1_000_000 // target_rate`.

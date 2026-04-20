@@ -191,12 +191,7 @@ class FlacEncoder:
 
     @property
     def pending_timestamp_us(self) -> int | None:
-        """Timestamp of the next output frame, or None if stream not started.
-
-        Uses exact rational arithmetic (`samples * 1e6 // sample_rate`) instead of
-        accumulating `chunk_duration_us` to avoid drift when sample_rate doesn't
-        divide cleanly into chunk_samples * 1e6 (e.g. 44.1kHz).
-        """
+        """Timestamp of the next output frame, or None if stream not started."""
         if self._stream_start_timestamp_us is None:
             return None
         cumulative_samples = self._output_frame_count * self._chunk_samples
@@ -417,14 +412,7 @@ class OpusEncoder:
 
     @property
     def pending_timestamp_us(self) -> int | None:
-        """Timestamp of the next output frame, or None if stream not started.
-
-        Uses exact rational arithmetic (`samples * 1e6 // sample_rate`) instead of
-        accumulating `chunk_duration_us`. Opus only allows sample rates where the
-        product divides cleanly today (8/12/16/24/48 kHz at 960 samples), so this
-        is currently equivalent to the old formula — but the rational version is
-        future-proof against any new chunk_size or rate that doesn't divide.
-        """
+        """Timestamp of the next output frame, or None if stream not started."""
         if self._stream_start_timestamp_us is None:
             return None
         cumulative_samples = self._output_frame_count * self._chunk_samples
