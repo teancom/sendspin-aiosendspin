@@ -2704,8 +2704,10 @@ def test_resampler_passthrough_44100_no_cumulative_drift() -> None:
 
     # Cumulative pending must equal n_calls * 1102 * 1_000_000 // 44100 exactly.
     expected = n_calls * 1102 * 1_000_000 // 44100
-    assert state.pending_timestamp_us == expected, (
-        f"resampler accumulated {state.pending_timestamp_us - expected}µs of "
+    actual = state.pending_timestamp_us
+    assert actual is not None
+    assert actual == expected, (
+        f"resampler accumulated {actual - expected}µs of "
         f"drift over {n_calls} calls — regression of the per-call truncation bug"
     )
 
